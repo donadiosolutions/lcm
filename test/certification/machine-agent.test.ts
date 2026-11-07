@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -424,6 +424,96 @@ describe("observability probes", () => {
     expect(record).toMatchObject({ runId: "run", contractSha256: "a".repeat(64), rawBytes: body.length, cardinality: { verdict: "pass" }, durationMs: 10 });
     expect(readFileSync(join(evidenceDirectory, "raw-probes", "steady-a-probe-0.json"))).toEqual(body);
     expect(JSON.parse(readFileSync(join(evidenceDirectory, "probes.ndjson"), "utf8")).rawSha256).toBe(createHash("sha256").update(body).digest("hex"));
+  });
+
+  // Option (A), agent side: a calibration probe writes its sample request right after it dispatches
+  // the status request, then stamps completion only after it reads the coordinator's answer or its
+  // deadline, 1 second after the request, passes. A missing, late or mismatched answer leaves the
+  // probe unsampled without failing it, and a response that outlasts the deadline never waits.
+  const acknowledged = { status: "acknowledged", sampleStartedAtMs: 1_079, observedAtMs: 1_080 };
+  it.each([
+    { name: "an answer taken in flight", durationMs: 120, answer: { atMs: 1_080, observedAtMs: 1_080 }, sample: acknowledged, completedAtMs: 1_120 },
+    { name: "an answer awaited after a short response", durationMs: 40, answer: { atMs: 1_080, observedAtMs: 1_080 }, sample: acknowledged, completedAtMs: 1_080 },
+    { name: "an answer still being written", durationMs: 40, answer: { atMs: 1_080, observedAtMs: 1_080, partial: true }, sample: acknowledged, completedAtMs: 1_080 },
+    { name: "no answer", durationMs: 40, answer: undefined, sample: { status: "missed", reason: "timeout" }, completedAtMs: 2_000 },
+    { name: "a late answer", durationMs: 40, answer: { atMs: 1_080, observedAtMs: 2_001 }, sample: { status: "missed", reason: "late" }, completedAtMs: 1_080 },
+    { name: "an answer for another probe", durationMs: 40, answer: { atMs: 1_080, observedAtMs: 1_080, id: "calibration-2-b-probe-3" }, sample: { status: "missed", reason: "invalid" }, completedAtMs: 1_080 },
+    { name: "a response that outlasts the deadline without an answer", durationMs: 1_500, answer: undefined, sample: { status: "missed", reason: "timeout" }, completedAtMs: 2_500 },
+    { name: "a response that outlasts the deadline after an in-flight answer", durationMs: 1_500, answer: { atMs: 1_080, observedAtMs: 1_080 }, sample: acknowledged, completedAtMs: 2_500 },
+  ])("settles a calibration probe's connection sample on $name", async ({ durationMs, answer, sample, completedAtMs }) => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-probe-sample-"));
+    const requestFile = join(evidenceDirectory, "calibration-pair-2-probe-3-sample-request.json");
+    const answerFile = join(evidenceDirectory, "calibration-pair-2-probe-3-sample.json");
+    const partialAnswer = "{\"id\":\"calibration-2-a-probe-3\"";
+    const clock = { now: 1_000 };
+    const delays: number[] = [];
+    let requestAtDispatch: unknown;
+    // The coordinator's answer appears once the clock reaches answer.atMs; a partial answer is
+    // visible before that.
+    const coordinate = () => {
+      if (answer === undefined) return;
+      const content = existsSync(answerFile) ? readFileSync(answerFile, "utf8") : undefined;
+      if (clock.now >= answer.atMs && (content === undefined || content === partialAnswer)) {
+        writeFileSync(answerFile, `${JSON.stringify({ id: answer.id ?? "calibration-2-a-probe-3", sampleStartedAtMs: answer.observedAtMs - 1, observedAtMs: answer.observedAtMs })}\n`);
+      } else if (clock.now < answer.atMs && answer.partial && content === undefined) {
+        writeFileSync(answerFile, partialAnswer);
+      }
+    };
+    const record = await runRawStatusProbe({
+      id: "calibration-2-a-probe-3", machine: "a", phase: "calibration-2", sequence: 3,
+      runId: "run", contractSha256: "a".repeat(64), cwd: "/project", token: "token", evidenceDirectory, operationIds: [],
+      calibrationSample: { pair: 2 },
+      now: () => clock.now,
+      delay: async (milliseconds: number) => { delays.push(milliseconds); clock.now += milliseconds; coordinate(); },
+      fetch: async () => {
+        await Promise.resolve();
+        requestAtDispatch = existsSync(requestFile) ? JSON.parse(readFileSync(requestFile, "utf8")) : undefined;
+        clock.now += durationMs;
+        coordinate();
+        return { status: 200, arrayBuffer: async () => Buffer.from(JSON.stringify({ backendDiagnostics: { classification: "healthy" } })) } as any;
+      },
+    });
+    expect(requestAtDispatch).toEqual({ id: "calibration-2-a-probe-3", pair: 2, sequence: 3, startedAtMs: 1_000, requestedAtMs: 1_000, sampleAtMs: 1_080, deadlineAtMs: 2_000 });
+    expect(record).toMatchObject({ status: 200, startedAtMs: 1_000, completedAtMs, durationMs: completedAtMs - 1_000, connectionSample: sample });
+    expect(record.connectionSample).toEqual(sample);
+    // The probe waited only as long as the answer or the deadline needed, in polls of at most 5 ms.
+    expect(delays.every((milliseconds) => milliseconds > 0 && milliseconds <= 5)).toBe(true);
+    expect(delays.reduce((sum, milliseconds) => sum + milliseconds, 0)).toBe(Math.max(0, completedAtMs - (1_000 + durationMs)));
+    expect(JSON.parse(readFileSync(join(evidenceDirectory, "probes.ndjson"), "utf8")).connectionSample).toEqual(sample);
+  });
+
+  it("keeps a calibration probe whose sample request cannot be written unsampled without waiting", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-probe-sample-"));
+    const requestFile = join(evidenceDirectory, "calibration-pair-1-probe-0-sample-request.json");
+    writeFileSync(requestFile, "{}\n");
+    let clock = 1_000;
+    const delays: number[] = [];
+    const record = await runRawStatusProbe({
+      id: "calibration-1-b-probe-0", machine: "b", phase: "calibration-1", sequence: 0,
+      runId: "run", contractSha256: "a".repeat(64), cwd: "/project", token: "token", evidenceDirectory, operationIds: [],
+      calibrationSample: { pair: 1 },
+      now: () => clock,
+      delay: async (milliseconds: number) => { delays.push(milliseconds); clock += milliseconds; },
+      fetch: async () => {
+        clock += 40;
+        return { status: 200, arrayBuffer: async () => Buffer.from(JSON.stringify({ backendDiagnostics: { classification: "healthy" } })) } as any;
+      },
+    });
+    expect(record).toMatchObject({ status: 200, completedAtMs: 1_040, connectionSample: { status: "missed", reason: "no-request" } });
+    expect(delays).toEqual([]);
+    expect(readFileSync(requestFile, "utf8")).toBe("{}\n");
+  });
+
+  it("does not request a connection sample for probes outside calibration", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-probe-sample-"));
+    const record = await runRawStatusProbe({
+      id: "steady-a-probe-0", machine: "a", phase: "steady", sequence: 0,
+      runId: "run", contractSha256: "a".repeat(64), cwd: "/project", token: "token", evidenceDirectory, operationIds: [],
+      now: (() => { let value = 1_000; return () => value += 10; })(),
+      fetch: async () => ({ status: 200, arrayBuffer: async () => Buffer.from(JSON.stringify({ backendDiagnostics: { classification: "healthy" } })) }) as any,
+    });
+    expect(record).not.toHaveProperty("connectionSample");
+    expect(readdirSync(evidenceDirectory).sort()).toEqual(["probes.ndjson", "raw-probes"]);
   });
 });
 

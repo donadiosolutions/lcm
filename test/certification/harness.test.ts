@@ -725,6 +725,141 @@ describe("certification harness", () => {
     }).toEqual({ verdict: "pass", machines: [["a", "pass", 2, 48, 1, false], ["b", "pass", 3, 48, 1, false]] });
   });
 
+  // Option (A): the coordinator answered every calibration probe with a sample 80 ms in, but a
+  // sample counts only when the probe's record confirms the answer it read and the sample lies
+  // inside its interval. Probes start 300 ms after the whole-second samples, so none of those
+  // lands in any interval, as on the certifying testbox. A machine whose answers were all missed,
+  // late or unconfirmed has no sampled interval and stays incomplete (D3).
+  it("counts only per-probe samples that their probe confirmed inside its interval", () => {
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    const definition = contract.observability.calibration;
+    const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
+    const startAtMs = Date.parse("2026-11-06T14:43:00.000Z");
+    const probes = ["a", "b"].flatMap((machine) => Array.from({ length: definition.pairs }, (_, index) => index + 1).flatMap((pair) =>
+      Array.from({ length: definition.probesPerMachinePerWindow }, (_, sequence) => {
+        const startedAtMs = startAtMs + ((pair - 1) * windowSeconds + definition.baselineWindowSeconds) * 1000 + sequence * 15_000 + 300;
+        return { id: `calibration-${pair}-${machine}-probe-${sequence}`, phase: `calibration-${pair}`, machine, startedAtMs, completedAtMs: startedAtMs + 120, snapshot: { classification: "healthy" } };
+      })));
+    const samples = Array.from({ length: definition.pairs * windowSeconds + 1 }, (_, second) => ({
+      second, observedAtMs: startAtMs + second * 1000, cpuUsageUsec: { a: 0, b: 0, database: 0 },
+      statements: { calls: 0, stats_reset: 1, dealloc: 0, xact_commit: 0, xact_rollback: 0 },
+      connectionCounts: { a: 1, b: 1, unknown: 0 },
+    }));
+    // Each sample sees its own probe's diagnostic connection over the baseline of 1.
+    const probeSamples = probes.map((probe) => ({
+      probeIds: [probe.id], sampleStartedAtMs: probe.startedAtMs + 79, observedAtMs: probe.startedAtMs + 80,
+      connectionCounts: { a: probe.machine === "a" ? 2 : 1, b: probe.machine === "b" ? 2 : 1, unknown: 0 },
+    }));
+    type Probe = (typeof probes)[number];
+    const confirmed = (probe: Probe) => ({ ...probe, connectionSample: { status: "acknowledged", sampleStartedAtMs: probe.startedAtMs + 79, observedAtMs: probe.startedAtMs + 80 } });
+    const finalize = (machineB: (probe: Probe) => object) => finalizeCalibrationEvidence(
+      { startAt: new Date(startAtMs).toISOString(), samples, probeSamples, quotas: { database: { cpus: 1 } }, addressLabels: { a: true, b: true } },
+      probes.map((probe) => probe.machine === "a" ? confirmed(probe) : machineB(probe)), contract,
+      { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence: { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 2 } } } },
+    ).connections;
+    const outcome = (connections: any) => ({
+      verdict: connections.verdict,
+      machines: connections.machines.map((entry: any) => [entry.machine, entry.verdict, entry.sampledActiveIntervals, entry.activeIntervals, entry.sampledIncrement]),
+    });
+    const allConfirmed = finalize(confirmed);
+    expect(outcome(allConfirmed)).toEqual({ verdict: "pass", machines: [["a", "pass", 48, 48, 1], ["b", "pass", 48, 48, 1]] });
+    expect(allConfirmed.machines.flatMap((entry: any) => entry.probeSampleDiagnostics.map((diagnostic: any) => [diagnostic.offsetMs, diagnostic.countMinusBaseline])))
+      .toEqual(probes.map(() => [80, 1]));
+    for (const machineB of [
+      (probe: Probe) => ({ ...probe, connectionSample: { status: "missed", reason: "timeout" } }),
+      (probe: Probe) => ({ ...probe, connectionSample: { status: "missed", reason: "late" } }),
+      // An acknowledgment of a sample the coordinator did not take for this probe.
+      (probe: Probe) => ({ ...probe, connectionSample: { status: "acknowledged", sampleStartedAtMs: probe.startedAtMs + 80, observedAtMs: probe.startedAtMs + 81 } }),
+      // A confirmed sample that the probe's interval had already closed before.
+      (probe: Probe) => ({ ...confirmed(probe), completedAtMs: probe.startedAtMs + 50 }),
+      (probe: Probe) => probe,
+    ]) {
+      const connections = finalize(machineB);
+      expect(outcome(connections)).toEqual({ verdict: "incomplete", machines: [["a", "pass", 48, 48, 1], ["b", "incomplete", 0, 48, 0]] });
+      expect(connections.machines[1].probeSampleDiagnostics.every((diagnostic: any) => diagnostic.offsetMs === null && diagnostic.countMinusBaseline === null)).toBe(true);
+    }
+  });
+
+  // Option (A), coordinator side: during an open probe window it answers each valid request once,
+  // at the requested time, with the same connection query. A request that does not parse yet is
+  // read again on a later poll; an invalid or expired request is never sampled or answered.
+  it("answers valid per-probe sample requests at their requested time and never invalid or expired ones", async () => {
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    contract.observability.calibration = {
+      ...contract.observability.calibration,
+      pairs: 1, baselineWindowSeconds: 1, probeWindowSeconds: 2, probesPerMachinePerWindow: 3,
+    };
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-probe-samples-"));
+    const directories = { a: join(root, "machine-a"), b: join(root, "machine-b") };
+    for (const directory of Object.values(directories)) mkdirSync(directory);
+    const requestPath = (machine: "a" | "b", sequence: number) => join(directories[machine], `calibration-pair-1-probe-${sequence}-sample-request.json`);
+    const answerPath = (machine: "a" | "b", sequence: number) => join(directories[machine], `calibration-pair-1-probe-${sequence}-sample.json`);
+    const request = (machine: "a" | "b", sequence: number, startedAtMs: number, overrides: Record<string, unknown> = {}) => JSON.stringify({
+      id: `calibration-1-${machine}-probe-${sequence}`, pair: 1, sequence, startedAtMs, requestedAtMs: startedAtMs,
+      sampleAtMs: startedAtMs + 80, deadlineAtMs: startedAtMs + 1_000, ...overrides,
+    });
+    let clock = 0;
+    let lateRequestWritten = false;
+    const connectionQueries: number[] = [];
+    const raw = await collectCalibrationEvidence({
+      contract,
+      startAt: new Date(0).toISOString(),
+      machineNames: { a: "machine-a", b: "machine-b" },
+      databaseContainer: "database",
+      run: async (args: string[]) => {
+        if (args[1] === "inspect") {
+          return { stdout: JSON.stringify([{ NetworkSettings: { Networks: { test: { IPAddress: args[2] === "machine-a" ? "10.0.0.2" : "10.0.0.3" } } } }]) };
+        }
+        if (args.at(-1) === "/sys/fs/cgroup/cpu.max") return { stdout: "100000 100000\n" };
+        return { stdout: "usage_usec 1000\n" };
+      },
+      adminUrl: "postgresql://admin@db/lcm",
+      caFile: "/unused",
+      runtimeRole: "runtime",
+      clientFactory: () => ({
+        connect: async () => undefined,
+        end: async () => undefined,
+        query: async (sql: string) => {
+          if (sql.includes("pg_stat_activity")) {
+            connectionQueries.push(clock);
+            return { rows: [{ client_address: "10.0.0.2", connections: 2 }, { client_address: "10.0.0.3", connections: 1 }] };
+          }
+          return { rows: [{ calls: 0, total_exec_time: 0, total_plan_time: 0, stats_reset: 1, dealloc: 0, xact_commit: 0, xact_rollback: 0 }] };
+        },
+      }),
+      machineEvidenceDirectories: directories,
+      now: () => clock,
+      delay: async (milliseconds: number) => {
+        clock += milliseconds;
+        // B's third request finishes being written 300 ms into the window.
+        if (!lateRequestWritten && clock >= 1_300) {
+          writeFileSync(requestPath("b", 2), request("b", 2, 1_300));
+          lateRequestWritten = true;
+        }
+      },
+      onProbeWindowStart: async (_pair: number, sample: { observedAtMs: number }) => {
+        const openedAtMs = sample.observedAtMs;
+        writeFileSync(requestPath("a", 0), request("a", 0, openedAtMs));
+        writeFileSync(requestPath("a", 1), request("a", 1, openedAtMs - 2_000));
+        writeFileSync(requestPath("b", 0), request("b", 0, openedAtMs, { id: "calibration-1-a-probe-0" }));
+        writeFileSync(requestPath("b", 1), request("b", 1, openedAtMs + 500));
+        writeFileSync(requestPath("b", 2), "");
+      },
+    });
+    const counts = { a: 2, b: 1, unknown: 0 };
+    expect(raw.probeSamples).toEqual([
+      { probeIds: ["calibration-1-a-probe-0"], sampleStartedAtMs: 1_080, observedAtMs: 1_080, connectionCounts: counts },
+      { probeIds: ["calibration-1-b-probe-2"], sampleStartedAtMs: 1_380, observedAtMs: 1_380, connectionCounts: counts },
+      { probeIds: ["calibration-1-b-probe-1"], sampleStartedAtMs: 1_580, observedAtMs: 1_580, connectionCounts: counts },
+    ]);
+    // Three admin queries beyond the four one-second samples.
+    expect(connectionQueries).toEqual([0, 1_000, 1_080, 1_380, 1_580, 2_000, 3_000]);
+    expect(JSON.parse(readFileSync(answerPath("b", 1), "utf8"))).toEqual({ id: "calibration-1-b-probe-1", sampleStartedAtMs: 1_580, observedAtMs: 1_580 });
+    // The expired request and the one naming another probe got no answer.
+    expect([["a", 0], ["a", 1], ["b", 0], ["b", 1], ["b", 2]].map(([machine, sequence]) => existsSync(answerPath(machine as "a" | "b", sequence as number))))
+      .toEqual([true, false, false, true, true]);
+  });
+
   // Smokes 3 and 4 recorded the same integer calls: 57 idle calls in three baseline windows, 102
   // (a 45-call burst) in the third, and 2217 in every probe window (57 idle + 24 probes x 90). The
   // burst pair is dropped by the median baseline count; the rest cost exactly 90 per probe.

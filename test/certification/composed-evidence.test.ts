@@ -3,14 +3,16 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { reconstructObservabilitySummary } from "../../scripts/certification-harness.mjs";
+import { collectCalibrationEvidence, finalizeCalibrationEvidence, reconstructObservabilitySummary } from "../../scripts/certification-harness.mjs";
 import { normalizeSearchLayers, normalizeSearchLimit } from "../../src/retrieval.js";
 import { poolTelemetry } from "../../src/storage/runtime-health.js";
 import {
   executeControlledObservabilityPhase,
   executeDeterministicSchedule,
+  executeProbeSchedule,
   executeRecoveryProbePhase,
   runRawStatusProbe,
+  waitForControl,
 } from "./machine-agent.mjs";
 import { createProbeSchedule } from "./observability.mjs";
 import { createFaultSchedule, createObservabilityWorkloadSchedule } from "./schedule.mjs";
@@ -272,5 +274,159 @@ describe("composed observability evidence", () => {
       late.clearedAtMs + contract.observability.clearanceSeconds.saturation * 1000 + 1_000);
     const rejected = reconstructSaturation(late, { a: saturationSamples("a", late.appliedAtMs, late.clearedAtMs), b: unbounded });
     expect(verdicts(rejected, ["correctness.saturation", "recovery.saturation"])).toEqual({ "correctness.saturation": "fail", "recovery.saturation": "fail" });
+  });
+});
+
+// A discrete-event clock for code that takes injected now and delay functions: each pending delay
+// is a timer, and the driver lets all runnable work settle before it advances to the earliest one.
+function eventClock(startMs: number) {
+  let current = startMs;
+  let order = 0;
+  const timers: Array<{ atMs: number; order: number; resolve: () => void }> = [];
+  const settle = async (turns = 3) => {
+    for (let turn = 0; turn < turns; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  };
+  return {
+    now: () => current,
+    delay: (milliseconds: number) => new Promise<void>((resolve) => {
+      order += 1;
+      timers.push({ atMs: current + Math.max(0, milliseconds), order, resolve });
+    }),
+    pending: () => timers.length,
+    settle,
+    async run<T>(work: Promise<T>, limitMs: number): Promise<T> {
+      let finished = false;
+      void work.then(() => { finished = true; }, () => { finished = true; });
+      for (;;) {
+        await settle();
+        if (finished) return work;
+        if (timers.length === 0) throw new Error("event clock has no pending timer");
+        timers.sort((left, right) => left.atMs - right.atMs || left.order - right.order);
+        const next = timers.shift()!;
+        if (next.atMs > startMs + limitMs) throw new Error("event clock limit exceeded");
+        current = Math.max(current, next.atMs);
+        next.resolve();
+      }
+    },
+  };
+}
+
+describe("calibration connection sampling", () => {
+  // Option (A) end to end: the real coordinator sampler and the real raw status probe exchange
+  // per-probe sample requests and answers through the machine evidence directories. The probes
+  // start 300 ms after a whole-second sample, as on the certifying testbox, whose one-second
+  // sampler caught 0 of 48 intervals per machine. A's probes take 120 ms and hold their diagnostic
+  // connection from 10 to 110 ms; B's take 40 ms and close it by 30 ms.
+  it("samples every short calibration probe inside its interval through the per-probe handshake", async () => {
+    const definition = {
+      ...contract.observability.calibration,
+      pairs: 4, baselineWindowSeconds: 3, probeWindowSeconds: 3, probeCadenceSeconds: 1, probesPerMachinePerWindow: 3,
+    };
+    const calibrationContract = { ...contract, observability: { ...contract.observability, calibration: definition } };
+    const { machineDirectory } = composedEvidence("calibration-sampling");
+    const clock = eventClock(Date.parse("2026-11-06T14:43:00.000Z"));
+    const durations: Record<string, number> = { a: 120, b: 40 };
+    const held: Record<string, Array<[number, number]>> = { a: [], b: [] };
+    const connections = (machine: string) => 1 + held[machine].filter(([from, until]) => clock.now() >= from && clock.now() <= until).length;
+    let cpu = 0;
+    let calls = 0;
+    const coordinator = collectCalibrationEvidence({
+      contract: calibrationContract,
+      startAt: new Date(clock.now() + 1_000).toISOString(),
+      machineNames: { a: "machine-a", b: "machine-b" },
+      databaseContainer: "database",
+      run: async (args: string[]) => {
+        if (args[1] === "inspect") {
+          return { stdout: JSON.stringify([{ NetworkSettings: { Networks: { test: { IPAddress: args[2] === "machine-a" ? "10.0.0.2" : "10.0.0.3" } } } }]) };
+        }
+        if (args.at(-1) === "/sys/fs/cgroup/cpu.max") return { stdout: "100000 100000\n" };
+        // A boundary CPU read takes 100 ms, as a container exec does, so the three reads put each
+        // probe window's start 300 ms after its boundary second.
+        await clock.delay(100);
+        cpu += 1_000;
+        return { stdout: `usage_usec ${cpu}\n` };
+      },
+      adminUrl: "postgresql://admin@db/lcm",
+      caFile: "/unused",
+      runtimeRole: "runtime",
+      clientFactory: () => ({
+        connect: async () => undefined,
+        end: async () => undefined,
+        query: async (sql: string) => {
+          if (sql.includes("pg_stat_activity")) {
+            return { rows: [{ client_address: "10.0.0.2", connections: connections("a") }, { client_address: "10.0.0.3", connections: connections("b") }] };
+          }
+          calls += 10;
+          return { rows: [{ calls, total_exec_time: 0, total_plan_time: 0, stats_reset: 1, dealloc: 0, xact_commit: calls, xact_rollback: 0 }] };
+        },
+      }),
+      machineEvidenceDirectories: { a: machineDirectory("a"), b: machineDirectory("b") },
+      now: clock.now,
+      delay: clock.delay,
+      onProbeWindowStart: async (pair: number, sample: { observedAtMs: number }) => {
+        for (const machine of ["a", "b"]) {
+          writeFileSync(join(machineDirectory(machine), `calibration-pair-${pair}-start.json`),
+            `${JSON.stringify({ pair, startAt: new Date(sample.observedAtMs).toISOString(), counterBoundaryObservedAtMs: sample.observedAtMs })}\n`, { flag: "wx" });
+        }
+      },
+      beforeProbeWindowEnd: async (pair: number) => {
+        for (const machine of ["a", "b"]) {
+          await waitForControl(join(machineDirectory(machine), `calibration-pair-${pair}-complete.json`), { deadlineMs: clock.now() + 10_000, now: clock.now, delay: clock.delay });
+        }
+      },
+    });
+    // The machine agent's calibration loop, with this definition's window and cadence.
+    const agent = async (machine: string) => {
+      const directory = machineDirectory(machine);
+      for (let pair = 1; pair <= definition.pairs; pair += 1) {
+        const boundary = await waitForControl(join(directory, `calibration-pair-${pair}-start.json`), { deadlineMs: clock.now() + 60_000, now: clock.now, delay: clock.delay });
+        const records = await executeProbeSchedule({
+          schedule: createProbeSchedule({
+            phase: `calibration-${pair}`, machine, appliedAtMs: Date.parse(boundary.startAt),
+            holdMaximumMs: definition.probeWindowSeconds * 1000, cadenceMs: definition.probeCadenceSeconds * 1000,
+            timeoutMs: contract.observability.probe.transportTimeoutMs,
+          }),
+          wait: clock.delay,
+          now: clock.now,
+          probe: (entry: { sequence: number }) => runRawStatusProbe({
+            ...entry, runId, contractSha256, cwd: "/project", token: "token", evidenceDirectory: directory,
+            operationIds: contract.observability.cardinality.operationIds,
+            calibrationSample: { pair },
+            now: clock.now,
+            delay: clock.delay,
+            fetch: async () => {
+              const dispatchedAtMs = clock.now();
+              held[machine].push([dispatchedAtMs + 10, dispatchedAtMs + durations[machine] - 10]);
+              await clock.delay(durations[machine]);
+              return { status: 200, arrayBuffer: async () => statusBytes("healthy", dispatchedAtMs + 5) };
+            },
+          }),
+        });
+        writeFileSync(join(directory, `calibration-pair-${pair}-complete.json`), `${JSON.stringify({ machine, pair, probes: records.length })}\n`, { flag: "wx" });
+      }
+    };
+    // The coordinator reaches its first wait before the agents start polling.
+    for (let turn = 0; turn < 1_000 && clock.pending() === 0; turn += 1) await clock.settle(1);
+    const [raw] = await clock.run(Promise.all([coordinator, agent("a"), agent("b")]), 60_000);
+    const probes = ["a", "b"].flatMap((machine) => readFileSync(join(machineDirectory(machine), "probes.ndjson"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line)));
+    const evidence = finalizeCalibrationEvidence(raw, probes, calibrationContract, {
+      stagedPackageSha256: "a".repeat(64),
+      configuredPoolEvidence: { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 2 } } },
+    });
+    expect(evidence.connections.machines.map((entry: any) => [entry.machine, entry.verdict, entry.sampledActiveIntervals, entry.activeIntervals, entry.sampledIncrement]))
+      .toEqual([["a", "pass", 12, 12, 1], ["b", "pass", 12, 12, 0]]);
+    // Every probe read its own answer, sampled 80 ms after it started and inside its interval.
+    expect(probes.map((probe: any) => [probe.connectionSample?.status, probe.connectionSample?.observedAtMs - probe.startedAtMs,
+      probe.connectionSample?.observedAtMs <= probe.completedAtMs])).toEqual(probes.map(() => ["acknowledged", 80, true]));
+    // A's samples landed while its connection was open. B's landed after its connection closed and
+    // read the baseline: a zero increment is not zero cost.
+    expect(evidence.connections.machines.map((entry: any) => [...new Set(entry.probeSampleDiagnostics.map((diagnostic: any) => `${diagnostic.offsetMs}:${diagnostic.countMinusBaseline}`))]))
+      .toEqual([["80:1"], ["80:0"]]);
+    // B's 40 ms probes held their intervals open for the answer; A's 120 ms probes did not wait.
+    expect(["a", "b"].map((machine) => [...new Set(probes.filter((probe: any) => probe.machine === machine).map((probe: any) => probe.durationMs))]))
+      .toEqual([[120], [80]]);
+    // The coordinator sampled each probe exactly once; requests due together shared one query.
+    expect(raw.probeSamples.flatMap((sample: any) => sample.probeIds).sort()).toEqual(probes.map((probe: any) => probe.id).sort());
   });
 });

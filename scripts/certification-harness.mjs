@@ -1193,6 +1193,13 @@ function cpuQuota(text) {
   return { cpus, source: "cgroup-cpu.max" };
 }
 
+// Option (A): while a calibration probe window is open, the coordinator also answers the machine
+// agents' per-probe sample requests (runRawStatusProbe in test/certification/machine-agent.mjs)
+// with the same runtime-role query on its one admin connection, at each request's sampleAtMs.
+// A request that does not parse yet is read again on the next poll; one that fails validation
+// or whose deadline has passed is never answered, so its probe stays unsampled.
+const CALIBRATION_SAMPLE_REQUEST_POLL_MS = 20;
+
 export async function collectCalibrationEvidence({
   contract,
   startAt,
@@ -1203,6 +1210,7 @@ export async function collectCalibrationEvidence({
   caFile,
   runtimeRole,
   clientFactory,
+  machineEvidenceDirectories,
   onProbeWindowStart = async () => undefined,
   beforeProbeWindowEnd = async () => undefined,
   delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -1221,7 +1229,80 @@ export async function collectCalibrationEvidence({
     inspect[label] = Object.values(networks).map((entry) => entry?.IPAddress).find(Boolean);
   }
   const labelsByAddress = new Map(Object.entries(inspect).map(([label, address]) => [address, label]));
+  const readConnectionCounts = async () => {
+    const connections = (await client.query(`SELECT COALESCE(pg_catalog.host(client_addr), 'local') AS client_address,
+        pg_catalog.count(*)::integer AS connections
+        FROM pg_catalog.pg_stat_activity
+        WHERE usename OPERATOR(pg_catalog.=) $1
+        GROUP BY client_addr ORDER BY client_addr`, [runtimeRole])).rows;
+    const counts = { a: 0, b: 0, unknown: 0 };
+    for (const row of connections) {
+      const label = labelsByAddress.get(row.client_address) ?? "unknown";
+      counts[label] += Number(row.connections);
+    }
+    return counts;
+  };
   const samples = [];
+  const probeSamples = [];
+  const settledProbeRequests = new Set();
+  let samplingPair = 0;
+  const openProbeRequests = () => {
+    const requests = [];
+    for (const [machine, directory] of Object.entries(machineEvidenceDirectories)) {
+      for (let sequence = 0; sequence < definition.probesPerMachinePerWindow; sequence += 1) {
+        const id = `calibration-${samplingPair}-${machine}-probe-${sequence}`;
+        const path = join(directory, `calibration-pair-${samplingPair}-probe-${sequence}-sample-request.json`);
+        if (settledProbeRequests.has(id) || !existsSync(path)) continue;
+        let request;
+        try { request = JSON.parse(readFileSync(path, "utf8")); } catch { continue; }
+        if (request?.id !== id || request.pair !== samplingPair || request.sequence !== sequence
+          || ![request.startedAtMs, request.sampleAtMs, request.deadlineAtMs].every(Number.isFinite)
+          || request.sampleAtMs < request.startedAtMs || request.deadlineAtMs < request.sampleAtMs) {
+          settledProbeRequests.add(id);
+          continue;
+        }
+        requests.push({ id, directory, pair: samplingPair, sequence, sampleAtMs: request.sampleAtMs, deadlineAtMs: request.deadlineAtMs });
+      }
+    }
+    return requests;
+  };
+  // Takes one sample for every request that is due and answers each of them; returns the next
+  // sampleAtMs among the requests that are still waiting.
+  const answerDueProbeRequests = async () => {
+    const open = openProbeRequests();
+    const sampleStartedAtMs = now();
+    const due = [];
+    for (const request of open) {
+      if (sampleStartedAtMs > request.deadlineAtMs) settledProbeRequests.add(request.id);
+      else if (sampleStartedAtMs >= request.sampleAtMs) due.push(request);
+    }
+    if (due.length > 0) {
+      const connectionCounts = await readConnectionCounts();
+      const observedAtMs = now();
+      probeSamples.push({ probeIds: due.map((request) => request.id), sampleStartedAtMs, observedAtMs, connectionCounts });
+      for (const request of due) {
+        settledProbeRequests.add(request.id);
+        try {
+          writeFileSync(join(request.directory, `calibration-pair-${request.pair}-probe-${request.sequence}-sample.json`),
+            `${JSON.stringify({ id: request.id, sampleStartedAtMs, observedAtMs })}\n`, { mode: 0o600, flag: "wx" });
+        } catch {
+          // An unwritten answer leaves that probe unsampled.
+        }
+      }
+    }
+    return Math.min(...open.filter((request) => !settledProbeRequests.has(request.id)).map((request) => request.sampleAtMs));
+  };
+  const waitUntil = async (target) => {
+    if (samplingPair === 0) {
+      if (target > now()) await delay(target - now());
+      return;
+    }
+    while (now() < target) {
+      const nextDueAtMs = await answerDueProbeRequests();
+      const wakeAtMs = Math.min(target, nextDueAtMs, now() + CALIBRATION_SAMPLE_REQUEST_POLL_MS);
+      if (wakeAtMs > now()) await delay(wakeAtMs - now());
+    }
+  };
   const quotas = {};
   for (const [label, name] of Object.entries(containerNames)) {
     quotas[label] = cpuQuota((await run(["container", "exec", name, "cat", "/sys/fs/cgroup/cpu.max"])).stdout);
@@ -1237,19 +1318,13 @@ export async function collectCalibrationEvidence({
   try {
     for (let second = 0; second <= totalSeconds; second += 1) {
       const target = startAtMs + second * 1000;
-      if (target > now()) await delay(target - now());
-      if (second > 0 && second % windowSeconds === 0) await beforeProbeWindowEnd(second / windowSeconds);
-      const sampleStartedAtMs = now();
-      const connections = (await client.query(`SELECT COALESCE(pg_catalog.host(client_addr), 'local') AS client_address,
-        pg_catalog.count(*)::integer AS connections
-        FROM pg_catalog.pg_stat_activity
-        WHERE usename OPERATOR(pg_catalog.=) $1
-        GROUP BY client_addr ORDER BY client_addr`, [runtimeRole])).rows;
-      const counts = { a: 0, b: 0, unknown: 0 };
-      for (const row of connections) {
-        const label = labelsByAddress.get(row.client_address) ?? "unknown";
-        counts[label] += Number(row.connections);
+      await waitUntil(target);
+      if (second > 0 && second % windowSeconds === 0) {
+        samplingPair = 0;
+        await beforeProbeWindowEnd(second / windowSeconds);
       }
+      const sampleStartedAtMs = now();
+      const counts = await readConnectionCounts();
       const sample = { second, scheduledAtMs: target, sampleStartedAtMs, connectionCounts: counts, boundary: boundarySeconds.has(second) };
       if (sample.boundary) {
         const cpu = {};
@@ -1279,16 +1354,18 @@ export async function collectCalibrationEvidence({
       samples.push(sample);
       if (second % windowSeconds === definition.baselineWindowSeconds) {
         await onProbeWindowStart(Math.floor(second / windowSeconds) + 1, sample);
+        if (machineEvidenceDirectories !== undefined) samplingPair = Math.floor(second / windowSeconds) + 1;
       }
     }
   } finally {
     await client.end().catch(() => undefined);
   }
-  return { startAt, samples, quotas, addressLabels: { a: Boolean(inspect.a), b: Boolean(inspect.b) } };
+  return { startAt, samples, probeSamples, quotas, addressLabels: { a: Boolean(inspect.a), b: Boolean(inspect.b) } };
 }
 
 export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPackageSha256, configuredPoolEvidence } = {}) {
   const { startAt, samples, quotas, addressLabels } = raw;
+  const probeSamples = raw.probeSamples ?? [];
   const definition = contract.observability.calibration;
   const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
   const startAtMs = Date.parse(startAt);
@@ -1369,6 +1446,14 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
   };
   const perMachineConnections = ["a", "b"].map((machineLabel) => {
     const probeRecords = probes.filter((probe) => probe.machine === machineLabel && String(probe.phase).startsWith("calibration-") && probe.transportFailure !== true && probe.snapshot);
+    // Option (A): a per-probe sample counts for a probe only when the probe's record confirms the
+    // answer it read and the sample lies inside the probe interval. A missed, late or unconfirmed
+    // answer leaves the probe to the one-second samples alone.
+    const acknowledgedProbeSample = (probe) => probe.connectionSample?.status !== "acknowledged" ? undefined
+      : probeSamples.find((sample) => Array.isArray(sample.probeIds) && sample.probeIds.includes(probe.id)
+        && sample.observedAtMs === probe.connectionSample.observedAtMs
+        && sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs);
+    const probeSampleDiagnostics = [];
     let coveredIntervals = 0;
     let measured = true;
     let residualBreach = false;
@@ -1379,20 +1464,32 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
       const baseline = samples.filter((sample) => sample.observedAtMs >= pairStart
         && sample.observedAtMs < pairStart + definition.baselineWindowSeconds * 1000);
       const active = samples.filter((sample) => pairProbes.some((probe) => sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs));
-      coveredIntervals += pairProbes.filter((probe) => active.some((sample) => sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs)).length;
+      const acknowledged = pairProbes.map((probe) => acknowledgedProbeSample(probe));
+      coveredIntervals += pairProbes.filter((probe, index) => acknowledged[index] !== undefined
+        || active.some((sample) => sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs)).length;
+      const baselineMaximum = baseline.length === 0 ? undefined : Math.max(...baseline.map((sample) => sample.connectionCounts[machineLabel]));
+      // Diagnostics only: where each per-probe sample landed and what it read over the baseline.
+      for (const [index, probe] of pairProbes.entries()) {
+        const sample = acknowledged[index];
+        probeSampleDiagnostics.push({
+          id: probe.id,
+          offsetMs: sample === undefined ? null : sample.observedAtMs - probe.startedAtMs,
+          countMinusBaseline: sample === undefined || baselineMaximum === undefined ? null : sample.connectionCounts[machineLabel] - baselineMaximum,
+        });
+      }
       // R3-10: coverage is recorded, not required. A one-second sampler catches only some
-      // short probe intervals; a pair whose intervals caught no sample adds no increment,
-      // and its residual is still checked.
+      // short probe intervals and the per-probe samples can be missed; a pair whose intervals
+      // caught no sample adds no increment, and its residual is still checked.
       if (baseline.length === 0 || pairProbes.length === 0) { measured = false; continue; }
-      const baselineMaximum = Math.max(...baseline.map((sample) => sample.connectionCounts[machineLabel]));
-      if (active.length > 0) increments.push(Math.max(0, Math.max(...active.map((sample) => sample.connectionCounts[machineLabel])) - baselineMaximum));
+      const inProbe = [...active, ...acknowledged.filter((sample) => sample !== undefined)];
+      if (inProbe.length > 0) increments.push(Math.max(0, Math.max(...inProbe.map((sample) => sample.connectionCounts[machineLabel])) - baselineMaximum));
       const last = Math.max(...pairProbes.map((probe) => probe.completedAtMs));
       const tail = samples.filter((sample) => sample.observedAtMs >= last && sample.observedAtMs <= last + definition.sampledConnectionResidualSeconds * 1000);
       if (tail.length === 0) measured = false;
       else if (tail.at(-1).connectionCounts[machineLabel] > baselineMaximum) residualBreach = true;
     }
     const sampledIncrement = Math.max(0, ...increments);
-    const unknown = samples.some((sample) => sample.connectionCounts.unknown > 0);
+    const unknown = [...samples, ...probeSamples].some((sample) => sample.connectionCounts.unknown > 0);
     const machineProbes = probeRecords.slice().sort((left, right) => left.startedAtMs - right.startedAtMs);
     const singleFlight = machineProbes.every((probe, index) => index === 0 || probe.startedAtMs >= machineProbes[index - 1].completedAtMs);
     const observedPoolMaxima = [configuredPoolEvidence?.configuredPoolMax,
@@ -1411,7 +1508,8 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
     return { machine: machineLabel, verdict, sampledIncrement, residualBreach, structuralMaximum,
       structural: { configuredPoolMax: observedPoolMax, pinnedPoolMax: contract.configuration.poolMax,
         cancellationAllowance: 1, singleFlight, stagedPackageSha256 },
-      activeIntervals: probeRecords.length, sampledActiveIntervals: coveredIntervals, zeroIncrementNotZeroCost: sampledIncrement === 0 };
+      activeIntervals: probeRecords.length, sampledActiveIntervals: coveredIntervals, zeroIncrementNotZeroCost: sampledIncrement === 0,
+      probeSampleDiagnostics };
   });
   const connections = {
     verdict: perMachineConnections.some((entry) => entry.verdict === "fail") ? "fail"
@@ -1420,7 +1518,7 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
     machines: perMachineConnections,
   };
   connections.zeroIncrementNotZeroCost = connections.sampledIncrement === 0;
-  return { startAt, samples, pairs, statementPairs, machine, database, statements, connections, quotas, addressLabels };
+  return { startAt, samples, probeSamples, pairs, statementPairs, machine, database, statements, connections, quotas, addressLabels };
 }
 
 function walkFiles(root, directory = root, files = []) {
@@ -2351,6 +2449,7 @@ export async function runLocalCertification(options, dependencies = {}) {
             adminUrl: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
             caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
             runtimeRole: "lcm_test_runtime",
+            machineEvidenceDirectories: Object.fromEntries(['a', 'b'].map((machine) => [machine, join(options.evidenceDirectory, `machine-${machine}`)])),
             delay: dependencies.delay,
             onProbeWindowStart: async (pair, sample) => {
               const startAt = new Date(sample.observedAtMs).toISOString();

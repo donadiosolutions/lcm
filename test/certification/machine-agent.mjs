@@ -339,6 +339,62 @@ export function createOperationFailureRecord(entry, error, errorClass, environme
 
 const PROBE_BODY_MAX_BYTES = 1024 * 1024;
 
+// Option (A) calibration connection sampling. A calibration probe's status request opens a
+// transient diagnostic runtime whose connection closes before the response, so the probe asks
+// the coordinator for one runtime-role pg_stat_activity sample while the request is in flight:
+// it writes a request file right after dispatching the request, the coordinator samples at
+// startedAtMs + CALIBRATION_SAMPLE_OFFSET_MS and writes the answer, and the probe stamps
+// completedAtMs only after reading that answer or at its deadline. The hold therefore ends by
+// request + CALIBRATION_SAMPLE_DEADLINE_MS, well under completedResponseMaxMs. A missing, late or
+// mismatched answer leaves the probe unsampled; the handshake never fails the probe itself.
+const CALIBRATION_SAMPLE_OFFSET_MS = 80;
+const CALIBRATION_SAMPLE_DEADLINE_MS = 1_000;
+const CALIBRATION_SAMPLE_POLL_MS = 5;
+
+function calibrationSampleHandshake({ evidenceDirectory, id, pair, sequence, now, delay }) {
+  const requestPath = join(evidenceDirectory, `calibration-pair-${pair}-probe-${sequence}-sample-request.json`);
+  const answerPath = join(evidenceDirectory, `calibration-pair-${pair}-probe-${sequence}-sample.json`);
+  let published;
+  return {
+    request(startedAtMs) {
+      const requestedAtMs = now();
+      const candidate = {
+        id, pair, sequence, startedAtMs, requestedAtMs,
+        sampleAtMs: startedAtMs + CALIBRATION_SAMPLE_OFFSET_MS,
+        deadlineAtMs: requestedAtMs + CALIBRATION_SAMPLE_DEADLINE_MS,
+      };
+      try {
+        writeFileSync(requestPath, `${JSON.stringify(candidate)}\n`, { mode: 0o600, flag: "wx" });
+        published = candidate;
+      } catch {
+        // Without a request there is no sample; the probe still runs.
+      }
+    },
+    async settle() {
+      if (published === undefined) return { status: "missed", reason: "no-request" };
+      for (;;) {
+        let answer;
+        if (existsSync(answerPath)) {
+          // An answer still being written does not parse yet; it is read again on the next poll.
+          try { answer = JSON.parse(readFileSync(answerPath, "utf8")); } catch { answer = undefined; }
+        }
+        if (answer !== undefined) {
+          if (answer?.id !== id || !Number.isFinite(answer.sampleStartedAtMs) || !Number.isFinite(answer.observedAtMs)) {
+            return { status: "missed", reason: "invalid" };
+          }
+          if (answer.observedAtMs < published.startedAtMs || answer.observedAtMs > published.deadlineAtMs) {
+            return { status: "missed", reason: "late" };
+          }
+          return { status: "acknowledged", sampleStartedAtMs: answer.sampleStartedAtMs, observedAtMs: answer.observedAtMs };
+        }
+        const remainingMs = published.deadlineAtMs - now();
+        if (remainingMs <= 0) return { status: "missed", reason: "timeout" };
+        await delay(Math.min(CALIBRATION_SAMPLE_POLL_MS, remainingMs));
+      }
+    },
+  };
+}
+
 export async function runRawStatusProbe({
   id,
   machine,
@@ -353,20 +409,26 @@ export async function runRawStatusProbe({
   inventory = [],
   canaries = [],
   operationIds,
+  calibrationSample,
   fetch: fetchImpl = globalThis.fetch,
   now = Date.now,
+  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 }) {
   if (!/^[a-z0-9][a-z0-9-]{0,127}$/u.test(id)) throw new Error("invalid certification probe identity");
   const startedAtMs = now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const handshake = calibrationSample === undefined ? undefined
+    : calibrationSampleHandshake({ evidenceDirectory, id, pair: calibrationSample.pair, sequence, now, delay });
   try {
-    const response = await fetchImpl("http://127.0.0.1:3737/status", {
+    const pending = fetchImpl("http://127.0.0.1:3737/status", {
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify({ cwd }),
       signal: controller.signal,
     });
+    handshake?.request(startedAtMs);
+    const response = await pending;
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.length > PROBE_BODY_MAX_BYTES) throw new Error("certification probe body exceeds its private evidence bound");
     const rawDirectory = join(evidenceDirectory, "raw-probes");
@@ -381,6 +443,7 @@ export async function runRawStatusProbe({
       operationIds,
       maximumOperations: 64,
     });
+    const connectionSample = await handshake?.settle();
     const completedAtMs = now();
     const record = {
       id, machine, phase, sequence, runId, contractSha256, startedAtMs, completedAtMs,
@@ -390,6 +453,7 @@ export async function runRawStatusProbe({
       rawBytes: bytes.length,
       scan,
       cardinality,
+      ...(connectionSample === undefined ? {} : { connectionSample }),
       snapshot: body?.backendDiagnostics,
     };
     appendNdjson(join(evidenceDirectory, "probes.ndjson"), record);
@@ -1749,6 +1813,7 @@ export async function runMachineAgent(environment = process.env) {
             inventory: probeInventory,
             canaries: CANARY_CORPUS,
             operationIds: contract.observability.cardinality.operationIds,
+            calibrationSample: { pair: pairNumber },
           }),
         });
         probeCount += records.length;

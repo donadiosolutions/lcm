@@ -210,17 +210,33 @@ windows, and requires at least three valid pairs for each CPU item and three
 retained pairs for the statement item. The approved ceilings, set from smokes 3 to
 5, are 2% of one CPU per machine, 3% of one CPU for the database, a 2% noise
 ceiling, one idle runtime-role call per second, and a sampled connection increment
-of 2; the statement rule follows below. A one-second connection sample is a
-sampled maximum, not an instantaneous peak; structural runtime/cancellation bounds
-and the unchanged v3 capacity gate remain separate.
+of 2; the statement rule follows below. A connection sample is a sampled maximum,
+not an instantaneous peak; structural runtime/cancellation bounds and the
+unchanged v3 capacity gate remain separate. The coordinator counts runtime-role
+connections in `pg_stat_activity` once per second, for baselines and residual
+tails, and once inside every calibration probe through the same evidence-directory
+handshake as the `calibration-pair-N-start` and `-complete` files. Each status
+probe opens a transient diagnostic runtime whose connection closes before the
+response, so the per-probe sample is taken while the request is in flight: the
+machine agent writes a request file right after sending the request, the
+coordinator runs the same query on its admin connection 80 ms after the probe
+started and writes the result back, and the agent records the probe's completion
+only after reading that answer or 1 second after its request. A per-probe sample
+counts only when the probe's record confirms the answer and the sample lies inside
+the probe interval; a missing, late, or mismatched answer leaves the probe
+unsampled. A sample that lands outside the connection's lifetime reads the
+baseline, so a zero increment is not zero cost. Calibration evidence records each
+probe's sample offset from its start and its sampled count minus the pair's
+baseline as diagnostics.
 The connections result records coverage, the number of probe intervals that caught
 a sample, without requiring every interval to be caught. It is incomplete when a
 machine has no sampled active interval, a connection address is unknown, or a pass
 condition cannot be checked. It passes when the sampled increment stays within the
 ceiling, the residual returns to the baseline within 5 seconds, and the structural
-bound holds, and it fails on a proven breach. The sampler stays at one sample per
-second because a faster sampler would add database CPU to the calibration it
-measures.
+bound holds, and it fails on a proven breach. The once-per-second sampler stays at
+that rate because a faster sampler would add database CPU to the calibration it
+measures; the per-probe samples add one admin query per probe, only inside probe
+windows.
 Database CPU percentage is the baseline-subtracted database CPU time over each
 probe window at the combined two-machine rate (two probes per 15 seconds), divided
 by the actual elapsed window and recorded database CPU quota.
