@@ -52,6 +52,23 @@ function migration(id: string, sql: string): PostgreSqlMigration {
   };
 }
 
+/**
+ * The rows one readiness check returned, or undefined when the statement was
+ * not that check's. A fused readiness statement (#1869) names its checks in
+ * its operation, joined by "+", and returns each check's rows as JSON in the
+ * f<index> column of its single row.
+ */
+function readinessCheckRows(
+  result: QueryResult<QueryResultRow>,
+  operation: string,
+  check: string,
+): readonly QueryResultRow[] | undefined {
+  const index = operation.split("+").indexOf(check);
+  if (index === -1) return undefined;
+  const part: unknown = result.rows[0]?.["f" + String(index)];
+  return Array.isArray(part) ? part as QueryResultRow[] : result.rows;
+}
+
 const ledgerSql = `CREATE SCHEMA IF NOT EXISTS lcm;
 CREATE TABLE IF NOT EXISTS lcm.schema_migrations (
   id text PRIMARY KEY,
@@ -587,8 +604,9 @@ describe("PostgreSQL migrations and database isolation", () => {
           options: PostgreSqlQueryOptions,
         ): Promise<QueryResult<R>> => {
           const result = await database.runtime.query<R, I>(config, options);
-          if (options.operation === "inspectSchemaDefinitions") {
-            readinessDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+          const rows = readinessCheckRows(result, options.operation, "inspectSchemaDefinitions");
+          if (rows !== undefined) {
+            readinessDefinitionRow = rows[0] as DefinitionDiagnosticRow | undefined;
           }
           return result;
         };
@@ -1167,8 +1185,9 @@ describe("PostgreSQL migrations and database isolation", () => {
               options: PostgreSqlQueryOptions,
             ): Promise<QueryResult<R>> => {
               const result = await database.runtime.query<R, I>(config, options);
-              if (options.operation === "inspectSchemaDefinitions") {
-                readinessDefinitionRow = result.rows[0] as DefinitionDiagnosticRow | undefined;
+              const rows = readinessCheckRows(result, options.operation, "inspectSchemaDefinitions");
+              if (rows !== undefined) {
+                readinessDefinitionRow = rows[0] as DefinitionDiagnosticRow | undefined;
               }
               return result;
             },

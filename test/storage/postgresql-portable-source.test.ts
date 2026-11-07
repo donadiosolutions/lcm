@@ -25,7 +25,7 @@ function harness() {
       switch(options.operation) {
         case 'portableRegisteredIdentity': return {rows:[{admitted:true}]};
         case 'portableSourceWitness': return {rows:[{database_name:'source',database_oid:'123',server_address:'127.0.0.1',server_port:'5432'}]};
-        case 'portableSnapshotState': return {rows:[{backend_pid:123,tls:true,isolation:'repeatable read',read_only:'on',captured_at:'2026-09-06T12:34:56.123456Z'}]};
+        case 'portableSnapshotState': return {rows:[{admitted:true,backend_pid:123,tls:true,isolation:'repeatable read',read_only:'on',captured_at:'2026-09-06T12:34:56.123456Z'}]};
         default: throw new Error('unexpected SQL '+options.operation);
       }
     }), close:vi.fn(async()=>{})};
@@ -95,6 +95,10 @@ describe('PostgreSQL portable source admission', () => {
 
 afterEach(()=>vi.restoreAllMocks());
 const timestamp='2026-09-06T12:34:56.123456Z';
+/** A header page whose sentinel says whether a row follows its last header. */
+const headerPage=<H extends mapping.CanonicalHeader>(headers:H[],more=false):mapping.CanonicalHeaderPage<H>=>({headers,more});
+/** Rewrites each header of a page, keeping its sentinel. */
+const mapHeaders=<H extends mapping.CanonicalHeader>(page:mapping.CanonicalHeaderPage<H>,map:(header:H)=>H):mapping.CanonicalHeaderPage<H>=>({headers:page.headers.map(map),more:page.more});
 function dataHarness(extra:Partial<Record<PortableDomain,Record<string,unknown>[]>>={}) {
   const data:Partial<Record<PortableDomain,Record<string,unknown>[]>>={
     machines:[{machine_id:machineId,identity_key:'machine-source'}],
@@ -109,7 +113,7 @@ function dataHarness(extra:Partial<Record<PortableDomain,Record<string,unknown>[
   const positions=new Map(PORTABLE_RECORD_DOMAIN_ORDER.map(domain=>[domain,new Map(rows(domain).map((row,i)=>[locator(domain,row),i]))]));
   const list=vi.spyOn(mapping,'listCanonicalHeaders').mockImplementation(async(_db,_project,domain,after,limit)=>{
     const values=rows(domain); const start=after===null?0:positions.get(domain)!.get(after)!+1;
-    return values.slice(start,start+limit).map(row=>({locator:locator(domain,row),byteLength:'1000'}));
+    return headerPage(values.slice(start,start+limit).map(row=>({locator:locator(domain,row),byteLength:'1000'})),start+limit<values.length);
   });
   const read=vi.spyOn(mapping,'readCanonicalRow').mockImplementation(async(_db,_project,domain,key)=>
     byLocator.get(domain)!.get(key)??null);
@@ -121,11 +125,15 @@ function dataHarness(extra:Partial<Record<PortableDomain,Record<string,unknown>[
     }
     return found;
   });
-  vi.spyOn(mapping,'listConversationMessageHeaders').mockImplementation(async(_db,_project,conversation,after,limit)=>
-    (data.messages??[]).filter(row=>row.conversation_id===conversation&&(after===null||BigInt(String(row.seq))>BigInt(after)))
-      .sort((a,b)=>BigInt(String(a.seq))<BigInt(String(b.seq))?-1:1).slice(0,limit)
-      .map(row=>({locator:locator('messages',row),byteLength:'1000',seq:String(row.seq)})));
-  return {...harness(),data,list,read,contentRows};
+  vi.spyOn(mapping,'listConversationMessageHeaders').mockImplementation(async(_db,_project,conversation,after,limit)=>{
+    const values=(data.messages??[]).filter(row=>row.conversation_id===conversation&&(after===null||BigInt(String(row.seq))>BigInt(after)))
+      .sort((a,b)=>BigInt(String(a.seq))<BigInt(String(b.seq))?-1:1);
+    return headerPage(values.slice(0,limit).map(row=>({locator:locator('messages',row),byteLength:'1000',seq:String(row.seq)})),values.length>limit);
+  });
+  // Occupancy follows the live fixture data, which some tests extend after the harness exists.
+  const occupancy=vi.spyOn(mapping,'readCanonicalDomainOccupancy').mockImplementation(async(_db,_project,domains)=>
+    new Map(domains.map(domain=>[domain,(data[domain]?.length??0)>0])));
+  return {...harness(),data,list,read,contentRows,occupancy};
 }
 const page=(domain:PortableDomain,afterOrdinal=0,includePredecessor=false)=>({domain,afterOrdinal,includePredecessor,maxRecords:500 as const,maxBytes:150994944 as const});
 const open=(h:ReturnType<typeof harness>,expectedIdentity=identity())=>adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity},h.dependencies as never);
@@ -191,7 +199,7 @@ describe('PostgreSQL portable source ordering and lifetime',()=>{
     await expect(source.readDomainPage(page('project'))).rejects.toMatchObject({code:'closed'});
   });
   it('refuses oversized source metadata before fetching a payload',async()=>{
-    const h=dataHarness();h.list.mockResolvedValueOnce([{locator:'["1"]',byteLength:'150994945'}]);
+    const h=dataHarness();h.list.mockResolvedValueOnce(headerPage([{locator:'["1"]',byteLength:'150994945'}]));
     await expect(open(h)).rejects.toMatchObject({code:'record-unrepresentable'});
     expect(h.read).not.toHaveBeenCalled();expect(h.session.close).toHaveBeenCalledTimes(1);
   });
@@ -202,7 +210,7 @@ describe('PostgreSQL portable source ordering and lifetime',()=>{
   });
   it('admits projected raw rows through144MiB before exact canonical encoding',async()=>{
     const h=dataHarness(),list=h.list.getMockImplementation()!;
-    h.list.mockImplementation(async(...args)=>(await list(...args)).map(header=>({...header,byteLength:'150994944'})));
+    h.list.mockImplementation(async(...args)=>mapHeaders(await list(...args),header=>({...header,byteLength:'150994944'})));
     const source=await open(h);
     expect((await source.readDomainPage(page('project'))).records).toHaveLength(1);
     await source.close();
@@ -255,7 +263,7 @@ describe('PostgreSQL source failure boundaries',()=>{
   });
   it.each([
     ['portableSourceWitness',{database_name:'source',database_oid:1,server_address:'localhost',server_port:'5432'}],
-    ['portableSnapshotState',{backend_pid:123,tls:false,isolation:'repeatable read',read_only:'on',captured_at:timestamp}],
+    ['portableSnapshotState',{admitted:true,backend_pid:123,tls:false,isolation:'repeatable read',read_only:'on',captured_at:timestamp}],
   ])('refuses invalid %s evidence from the actual session',async(operation,row)=>{
     const h=dataHarness(),original=h.session.query.getMockImplementation()!;
     h.session.query.mockImplementation((config,options)=>options.operation===operation?Promise.resolve({rows:[row]} as never):original(config,options));
@@ -267,7 +275,7 @@ describe('PostgreSQL source failure boundaries',()=>{
     expect(h.read).not.toHaveBeenCalled();
   });
   it('refuses malformed size evidence and missing rows without emitting data',async()=>{
-    const h=dataHarness();h.list.mockResolvedValueOnce([{locator:'["1"]',byteLength:'-1'}]);
+    const h=dataHarness();h.list.mockResolvedValueOnce(headerPage([{locator:'["1"]',byteLength:'-1'}]));
     await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
     h.contentRows.mockResolvedValue(new Map());
     await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
@@ -288,10 +296,10 @@ describe('PostgreSQL source failure boundaries',()=>{
     expect(h.contentRows).toHaveBeenCalledTimes(4);
   });
   it('refuses a backend header page exceeding the row bound or repeating its cursor',async()=>{
-    const h=dataHarness();h.list.mockResolvedValueOnce(Array.from({length:501},()=>({locator:'["1"]',byteLength:'1'})));
+    const h=dataHarness();h.list.mockResolvedValueOnce(headerPage(Array.from({length:501},()=>({locator:'["1"]',byteLength:'1'}))));
     await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
     h.data.conversations=[{conversation_id:'1',session_id:'s',title:null,bootstrapped_at:null,created_at:timestamp,updated_at:timestamp}];
-    h.list.mockResolvedValue([{locator:'["1"]',byteLength:'1'}]);
+    h.list.mockResolvedValue(headerPage([{locator:'["1"]',byteLength:'1'}],true));
     h.contentRows.mockImplementation(async(_db,_project,domain)=>domain==='conversations'?new Map([['["1"]',h.data.conversations![0]]]):new Map());
     await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
   });
@@ -299,7 +307,7 @@ describe('PostgreSQL source failure boundaries',()=>{
     const conversations=[{conversation_id:'1',session_id:'s',title:null,bootstrapped_at:null,created_at:timestamp,updated_at:timestamp}];
     const messages=['1','2'].map(seq=>({conversation_id:'1',message_id:seq,seq,role:'user',content:'content '+seq,token_count:'1',created_at:timestamp}));
     const h=dataHarness({conversations,messages}),source=await open(h);await source.close();
-    vi.mocked(mapping.listConversationMessageHeaders).mockResolvedValue([{locator:'["1"]',byteLength:'1',seq:'1'}]);
+    vi.mocked(mapping.listConversationMessageHeaders).mockResolvedValue(headerPage([{locator:'["1"]',byteLength:'1',seq:'1'}],true));
     await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
   });
   it('compares complete closures and rejects a forced digest collision',async()=>{
@@ -335,6 +343,38 @@ describe('PostgreSQL source failure boundaries',()=>{
       return result;
     });
     await expect(source.readDomainPage(page('project'))).rejects.toMatchObject({code:'source-changed'});await source.close();
+  });
+  it('refuses an unadmitted identity before comparing the capture time, in one statement per check (#1869)',async()=>{
+    const h=dataHarness(),source=await open(h),original=h.session.query.getMockImplementation()!;
+    h.session.query.mockClear();
+    h.session.query.mockImplementation(async(config,options)=>{
+      const result=await original(config,options);
+      if(options.operation==='portableSnapshotState') Object.assign(result.rows[0],{admitted:false,captured_at:'2026-09-07T12:34:56.123456Z'});
+      return result;
+    });
+    await expect(source.readDomainPage(page('project'))).rejects.toMatchObject({code:'source-invalid'});
+    expect(h.session.query.mock.calls.map(call=>call[1].operation)).toEqual(['portableSnapshotState']);
+    await source.close();
+  });
+  it('refuses a snapshot authentication statement without exactly one row',async()=>{
+    const h=dataHarness(),original=h.session.query.getMockImplementation()!;
+    h.session.query.mockImplementation((config,options)=>options.operation==='portableSnapshotState'?Promise.resolve({rows:[]} as never):original(config,options));
+    await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
+  });
+  it('refuses a domain occupancy that is not a boolean (#1869)',async()=>{
+    const h=dataHarness();
+    h.occupancy.mockResolvedValue(new Map(PORTABLE_RECORD_DOMAIN_ORDER.map(domain=>[domain,
+      domain==='session-ingest'?'yes':['machines','project','project-aliases'].includes(domain)])) as never);
+    await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
+    expect(h.list.mock.calls.map(call=>call[2])).toEqual(expect.arrayContaining(['machines','project','project-aliases']));
+  });
+  it('skips header paging for every domain the occupancy statement proves empty (#1869)',async()=>{
+    const h=dataHarness(),source=await open(h);
+    expect(h.occupancy).toHaveBeenCalledTimes(1);
+    expect(h.occupancy.mock.calls[0]![2]).toEqual(PORTABLE_RECORD_DOMAIN_ORDER);
+    expect(h.occupancy.mock.calls[0]![3]).toBe(false);
+    expect([...new Set(h.list.mock.calls.map(call=>call[2]))]).toEqual(['machines','project','project-aliases']);
+    await source.close();
   });
   it('refuses a missing predecessor or zero-progress metadata page',async()=>{
     const h=dataHarness(),source=await open(h);
@@ -532,8 +572,7 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
     // JSON-stringified index metadata, not the record payload this batch
     // reads. Before the aggregate-bytes chunking fix this issued exactly one
     // readCanonicalContentRows call for both locators.
-    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>)))
-      .map(header=>({...header,byteLength:'90000000'})));
+    h.list.mockImplementation(async(...args)=>mapHeaders(await list(...(args as Parameters<typeof list>)),header=>({...header,byteLength:'90000000'})));
     const source=await open(h);
     // Two chunks for the index build pass plus two for the capture boundary.
     const calls=h.contentRows.mock.calls.filter(call=>call[2]==='session-ingest');
@@ -553,12 +592,13 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
     // listCanonicalHeaders bounds a page by aggregate locator bytes in SQL, so
     // a page can be shorter than the record bound while rows remain. Emulate a
     // backend that cuts every page after two headers.
-    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>))).slice(0,2));
+    h.list.mockImplementation(async(...args)=>{const page=await list(...(args as Parameters<typeof list>));return headerPage(page.headers.slice(0,2),page.more||page.headers.length>2);});
     const source=await open(h);
     const calls=h.list.mock.calls.filter(call=>call[2]==='session-ingest');
     expect(calls.every(call=>call[4]===codec.PORTABLE_LIMITS.maxBatchRecords)).toBe(true);
-    // Each cursor is the last locator of the previous short page; the final page is empty.
-    expect(calls.map(call=>call[3])).toEqual([null,'["1"]','["3"]','["4"]']);
+    // Each cursor is the last locator of the previous short page; the last
+    // page's sentinel ends the walk without an empty page (#1869).
+    expect(calls.map(call=>call[3])).toEqual([null,'["1"]','["3"]']);
     const build=h.contentRows.mock.calls.filter(call=>call[2]==='session-ingest').slice(0,3).map(call=>call[3]);
     expect(build).toEqual([['["0"]','["1"]'],['["2"]','["3"]'],['["4"]']]);
     const batch=await source.readDomainPage(page('session-ingest'));
@@ -569,8 +609,7 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
   it('splits a build-pass header page whose rows together exceed the batch budget',async()=>{
     const rows2=['1','2'].map(ingest_key=>({ingest_key,session_id:ingest_key,message_count:'1',completed_at:timestamp}));
     const big=dataHarness({'session-ingest':rows2}),list=big.list.getMockImplementation()!;
-    big.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>)))
-      .map(header=>({...header,byteLength:'90000000'})));
+    big.list.mockImplementation(async(...args)=>mapHeaders(await list(...(args as Parameters<typeof list>)),header=>({...header,byteLength:'90000000'})));
     const bigSource=await open(big);
     // Each row fits the batch budget alone but the pair does not: two build-pass
     // chunks, each finished before the next read, in header order.
@@ -588,8 +627,7 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
   it('passes the caller signal to build-pass reads and stops before the next chunk once aborted',async()=>{
     const rows2=['1','2'].map(ingest_key=>({ingest_key,session_id:ingest_key,message_count:'1',completed_at:timestamp}));
     const h=dataHarness({'session-ingest':rows2}),list=h.list.getMockImplementation()!,controller=new AbortController();
-    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>)))
-      .map(header=>({...header,byteLength:'90000000'})));
+    h.list.mockImplementation(async(...args)=>mapHeaders(await list(...(args as Parameters<typeof list>)),header=>({...header,byteLength:'90000000'})));
     const original=h.contentRows.getMockImplementation()!;
     h.contentRows.mockImplementation(async(...args)=>{
       const found=await original(...args);
@@ -661,8 +699,7 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
   });
   it('rechecks the source signal before each completion boundary chunk when verifySource has no request signal',async()=>{
     const h=dataHarness({'session-ingest':rows(2)}),list=h.list.getMockImplementation()!,controller=new AbortController();
-    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>)))
-      .map(header=>({...header,byteLength:'90000000'})));
+    h.list.mockImplementation(async(...args)=>mapHeaders(await list(...(args as Parameters<typeof list>)),header=>({...header,byteLength:'90000000'})));
     const source=await adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity:identity(),signal:controller.signal},h.dependencies as never);
     const description=source.describeSource(),batch=await source.readDomainPage(page('session-ingest'));
     let prefix=sha(codec.canonicalJson(['lcm-portable-domain-v1',codec.PORTABLE_RECORD_SCHEMA_SHA256,'session-ingest',1]));
@@ -714,12 +751,12 @@ describe('PostgreSQL source batched closure and page reads (#1470, #1489)',()=>{
   const messageBytes=(bytes:(conversationId:string)=>string)=>{
     const base=vi.mocked(mapping.listConversationMessageHeaders).getMockImplementation()!;
     vi.mocked(mapping.listConversationMessageHeaders).mockImplementation(async(...args)=>
-      (await base(...args)).map(header=>({...header,byteLength:bytes(args[2])})));
+      mapHeaders(await base(...args),header=>({...header,byteLength:bytes(args[2])})));
   };
   const batches=(h:ReturnType<typeof dataHarness>,domain:PortableDomain)=>h.contentRows.mock.calls.filter(call=>call[2]===domain);
   const ingestBytes=(h:ReturnType<typeof dataHarness>,bytes:string)=>{
     const list=h.list.getMockImplementation()!;
-    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>))).map(header=>args[2]==='session-ingest'?{...header,byteLength:bytes}:header));
+    h.list.mockImplementation(async(...args)=>mapHeaders(await list(...(args as Parameters<typeof list>)),header=>args[2]==='session-ingest'?{...header,byteLength:bytes}:header));
   };
 
   it('budgets rows plus their locator copies on the build pass, the capture boundary and the page read (#1489)',async()=>{
@@ -769,8 +806,8 @@ describe('PostgreSQL source batched closure and page reads (#1470, #1489)',()=>{
     const count=501,messages=Array.from({length:count},(_,i)=>message('1',String(10000-i),i+1));
     const h=dataHarness({conversations:[conversation('1')],messages}),added=closures();
     const source=await open(h);
-    // ceil(501/500) pages plus the terminating empty page; the cursor is the last seq.
-    expect(headerCalls().map(call=>[call[3],call[4]])).toEqual([[null,500],['500',500],['501',500]]);
+    // ceil(501/500) pages, the last ended by its sentinel; the cursor is the last seq.
+    expect(headerCalls().map(call=>[call[3],call[4]])).toEqual([[null,500],['500',500]]);
     expect(h.read.mock.calls.filter(call=>call[2]==='messages')).toHaveLength(0);
     expect(batches(h,'messages').slice(0,2).map(call=>call[3].length)).toEqual([500,1]);
     expect(added).toEqual([closureSha(messages.map((_,i)=>token(i+1)))]);
@@ -801,8 +838,8 @@ describe('PostgreSQL source batched closure and page reads (#1470, #1489)',()=>{
     const source=await open(h);
     const expected=closureSha([1,2,3].map(seq=>token(seq)));
     expect(added).toEqual([expected,expected]);
-    // Two prepass walks and two finalize walks, each a page plus the empty page.
-    expect(headerCalls()).toHaveLength(8);
+    // Two prepass walks and two finalize walks, each one page ended by its sentinel.
+    expect(headerCalls()).toHaveLength(4);
     expect(batches(h,'messages').slice(0,8).map(call=>call[3].length)).toEqual([3,1,1,1,3,1,1,1]);
     await source.close();
   });
@@ -830,7 +867,7 @@ describe('PostgreSQL source batched closure and page reads (#1470, #1489)',()=>{
     ['an oversized row',()=>[{locator:'',byteLength:'150994945',seq:'1'}],'record-unrepresentable'],
   ])('refuses a message header page with %s',async(_name,headers,code)=>{
     const h=dataHarness({conversations:[conversation('1')],messages:[message('1','1',1)]});
-    vi.mocked(mapping.listConversationMessageHeaders).mockResolvedValue(headers());
+    vi.mocked(mapping.listConversationMessageHeaders).mockResolvedValue(headerPage(headers()));
     await expect(open(h)).rejects.toMatchObject({code});
   });
   it('stops a page at the first record that does not fit after checking its boundary, without examining later rows',async()=>{

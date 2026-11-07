@@ -26,6 +26,8 @@ import {
   MigrationVerificationDriverError,
   assertDestinationIdentityMatches,
   assertPermanentReadOnlyGuard,
+  assertSchemaWitnessLiveToLive,
+  captureDestinationSchemaWitness,
   completePendingMigrationVerification,
   buildMigrationCanonicalDelta,
   buildMigrationCensusVector,
@@ -58,7 +60,7 @@ const HASH_A = "a".repeat(64);
 // configuration read against the same compiled-in digest the schema
 // installer enforces (POSTGRESQL_SEARCH_CONFIGURATION_SHA256), not
 // just against a second in-window read of itself. Every "happy path"
-// stub of inspectPostgreSqlSearchConfiguration below must return this
+// stub of postgreSqlSearchConfigurationStatus below must return this
 // real constant rather than an arbitrary fixture hash like HASH_A, or
 // it now refuses before reaching whatever the test actually means to
 // exercise.
@@ -274,6 +276,51 @@ const SEQUENCE_BACKED_TABLES: Record<string, string> = {
   "passive-events": "lcm.passive_event_inbox",
 };
 
+type FakeQueryConfig = { text: string; values?: readonly unknown[] };
+type FakeQuery = (config: FakeQueryConfig) => Promise<{ rows: readonly unknown[] }>;
+/** One json_agg part of the fused schema-witness read (#1869), as readSchemaWitnessInputs writes it. */
+const FUSED_FRAGMENT = /\(SELECT COALESCE\(pg_catalog\.json_agg\(fragment_row(?: ORDER BY [^)]*)?\), '\[\]'::pg_catalog\.json\) FROM \(([\s\S]*?)\) AS fragment_row\) AS f(\d+)/gu;
+
+/**
+ * Answers the fused reads of #1869 the way the separate statements they
+ * replace were answered: the fused schema witness part by part, and the fused
+ * sequence read through the per-table reads it replaces, in their order and
+ * with their conditions (a table's sequence is looked up only when it has a
+ * row, its privilege only for a named sequence, its state only when held).
+ */
+function fused(query: FakeQuery): FakeQuery {
+  const first = async (config: FakeQueryConfig): Promise<Record<string, unknown> | undefined> => (
+    (await query(config)).rows[0] as Record<string, unknown> | undefined
+  );
+  return async (config) => {
+    if (config.text.startsWith("SELECT (SELECT COALESCE(pg_catalog.json_agg(fragment_row")) {
+      const row: Record<string, unknown> = {};
+      for (const match of config.text.matchAll(FUSED_FRAGMENT)) row[`f${match[2]!}`] = (await query({ text: match[1]! })).rows;
+      return { rows: [row] };
+    }
+    if (!config.text.includes("WITH target(position, max_value, table_name, column_name)")) return query(config);
+    const rows: Record<string, unknown>[] = [];
+    for (const [index, target] of Object.values(SEQUENCE_BACKED_IDENTITY_COLUMN).entries()) {
+      const maxValue = (await first({ text: `SELECT MAX(${target!.column})::text AS max_value FROM ${target!.table}` }))?.max_value ?? null;
+      const seqName = maxValue === null ? null : (await first({
+        text: "SELECT pg_catalog.pg_get_serial_sequence($1, $2) AS seq_name", values: [target!.table, target!.column],
+      }))?.seq_name ?? null;
+      const hasPrivilege = seqName === null ? null : (await first({
+        text: "SELECT pg_catalog.has_sequence_privilege($1::regclass, 'SELECT,USAGE') AS has_privilege", values: [seqName],
+      }))?.has_privilege ?? null;
+      const stored = hasPrivilege === true
+        ? await first({ text: "SELECT ps.last_value::text AS last_value FROM pg_catalog.pg_sequences ps", values: [seqName] })
+        : undefined;
+      rows.push({
+        position: index + 1, max_value: maxValue, seq_name: seqName, has_privilege: hasPrivilege,
+        last_value: stored?.last_value ?? null, start_value: stored?.start_value ?? null,
+        increment_by: stored?.increment_by ?? null, found: stored === undefined ? null : true,
+      });
+    }
+    return { rows };
+  };
+}
+
 interface LedgerBatchRowFixture {
   domain: string; prior_checkpoint_sha256: string; checkpoint_sha256: string;
   first_ordinal: string; next_ordinal: string;
@@ -320,7 +367,7 @@ function fakeSession(overrides: {
   const seqNameFor = (domain: string) => `lcm.fake_${domain}_seq`;
   return {
     identity: { sessionId: "window-session", backendPid: 999, projectId },
-    query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
+    query: vi.fn(fused(async (config: FakeQueryConfig) => {
       if (config.text.includes("pg_current_xact_id_if_assigned")) return { rows: [{ xid: overrides.xid ?? null }] };
       if (config.text.includes("attidentity")) {
         return { rows: identityColumns.map(({ tableName, columnName }) => ({ table_name: tableName, column_name: columnName })) };
@@ -420,7 +467,7 @@ function fakeSession(overrides: {
         return { rows: [{ system_identifier: overrides.systemIdentifier ?? "7123456789" }] };
       }
       return { rows: [{ admitted: true }] };
-    }),
+    })),
     close: vi.fn(async () => { /* fake */ }),
   };
 }
@@ -455,7 +502,7 @@ function fakeRuntime(overrides: {
   }];
   return {
     health: vi.fn(async () => ({ status: "healthy", backend: "postgresql", tls: true, serverMajorVersion: 18, serverEncoding: "UTF8" })),
-    query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
+    query: vi.fn(fused(async (config: FakeQueryConfig) => {
       if (config.text.includes("lcm.conversations") && config.text.includes("to_char(")) {
         // The listing probe's identity read: the portable mapping's
         // microsecond projection, as text. Derived from the repository rows
@@ -517,7 +564,7 @@ function fakeRuntime(overrides: {
         return { rows: [{ native_key: "1" }] };
       }
       return { rows: [{ system_identifier: "7123456789" }] };
-    }),
+    })),
     transaction: vi.fn(async (callback: (executor: unknown) => Promise<unknown>) => callback({
       // Round-2 P1: the search self-match probe runs
       // PostgreSqlLexicalSearchRepository.searchMessages through
@@ -564,7 +611,7 @@ function stubDestinationPrimitives(options: {
     acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
     releaseLease: vi.fn(async () => null),
   } as never); });
-  vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
+  vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus").mockReturnValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
   vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
   vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
     destinationWitnessSha256: HASH_A, identityFingerprintSha256: options.identityFingerprintSha256 ?? HASH_A,
@@ -660,7 +707,7 @@ describe("readFencedDestinationCensus", () => {
       assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus").mockReturnValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     vi.spyOn(portableSource, "readPostgreSqlPortableSourceDomainCensus").mockImplementation(((_s: unknown, domain: PortableDomain) => ({
       domain, recordCount: 2, prefixSha256: fakeHash("prefix-" + domain), terminalIdentitySha256: HASH_A,
@@ -1487,12 +1534,12 @@ describe("verifyMigrationGeneration", () => {
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
     const originalRuntimeQuery = runtime.query;
-    runtime.query = vi.fn(async (config: { text: string }) => {
+    runtime.query = vi.fn(fused(async (config) => {
       if (config.text.includes("lcm.schema_migrations")) {
         return { rows: [{ id: "0001", checksum_sha256: fakeHash("drifted-migration-checksum") }] };
       }
       return originalRuntimeQuery(config as never);
-    }) as never;
+    })) as never;
     const dependencies = dependenciesFor(copySource, runtime);
     await expect(verifyMigrationGeneration(
       baseInput({ homeDir: "/tmp/lcm-verify-live-migrations-drift", destinationMigrationsSha256: EXPECTED_MIGRATIONS_SHA256 }),
@@ -1508,9 +1555,9 @@ describe("verifyMigrationGeneration", () => {
     // migrations, so the comparison is the value captured before the
     // window against a second read taken from inside it.
     stubDestinationPrimitives();
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
-      .mockResolvedValueOnce({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never)
-      .mockResolvedValueOnce({ actualSha256: fakeHash("drifted-search-configuration") } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus")
+      .mockReturnValueOnce({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never)
+      .mockReturnValueOnce({ actualSha256: fakeHash("drifted-search-configuration") } as never);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
@@ -1521,9 +1568,9 @@ describe("verifyMigrationGeneration", () => {
 
   it("refuses when the destination search configuration becomes absent inside the fenced window", async () => {
     stubDestinationPrimitives();
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
-      .mockResolvedValueOnce({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never)
-      .mockResolvedValueOnce({ actualSha256: null } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus")
+      .mockReturnValueOnce({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never)
+      .mockReturnValueOnce({ actualSha256: null } as never);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
@@ -1541,12 +1588,12 @@ describe("verifyMigrationGeneration", () => {
     // census's row-level comparison cannot see.
     const driftedSession = fakeSession();
     const originalSessionQuery = driftedSession.query;
-    driftedSession.query = vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
+    driftedSession.query = vi.fn(fused(async (config) => {
       if (config.text.includes("pg_collation")) {
         return { rows: [{ collname: "drifted", collcollate: "en_US.UTF-8", collctype: "en_US.UTF-8", collprovider: "c" }] };
       }
       return originalSessionQuery(config);
-    }) as never;
+    })) as never;
     const runtime = fakeRuntime({ session: driftedSession });
     const dependencies = dependenciesFor(copySource, runtime);
     await expect(verifyMigrationGeneration(
@@ -1604,7 +1651,7 @@ describe("verifyMigrationGeneration", () => {
       acquireLease: vi.fn(async () => null),
       releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus").mockReturnValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
       destinationWitnessSha256: HASH_A, identityFingerprintSha256: HASH_A, nonIdentityDomainsEmpty: true, existingRun: null,
@@ -1623,8 +1670,8 @@ describe("verifyMigrationGeneration", () => {
       assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
-      .mockResolvedValue({ actualSha256: null, objectCount: 0, ownershipReady: false } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus")
+      .mockReturnValue({ actualSha256: null, objectCount: 0, ownershipReady: false } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
@@ -1648,8 +1695,8 @@ describe("verifyMigrationGeneration", () => {
       assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
-      .mockResolvedValue({ actualSha256: fakeHash("stable-wrong-search-configuration"), objectCount: 19, ownershipReady: true } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus")
+      .mockReturnValue({ actualSha256: fakeHash("stable-wrong-search-configuration"), objectCount: 19, ownershipReady: true } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
@@ -1671,8 +1718,8 @@ describe("verifyMigrationGeneration", () => {
       assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
-      .mockResolvedValue({ actualSha256: null, objectCount: 1, ownershipReady: false } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus")
+      .mockReturnValue({ actualSha256: null, objectCount: 1, ownershipReady: false } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
@@ -1689,7 +1736,7 @@ describe("verifyMigrationGeneration", () => {
       assertLeaseFence: vi.fn(async () => ({})),
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus").mockReturnValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
     const badRuntime = fakeRuntime();
@@ -1698,10 +1745,10 @@ describe("verifyMigrationGeneration", () => {
     // normally, or this refuses for the wrong reason before the
     // system-identifier check is ever reached.
     const originalBadRuntimeQuery = badRuntime.query;
-    badRuntime.query = vi.fn(async (config: { text: string }) => {
+    badRuntime.query = vi.fn(fused(async (config) => {
       if (config.text.includes("pg_control_system")) return { rows: [{ system_identifier: "not-a-number" }] };
       return originalBadRuntimeQuery(config as never);
-    }) as never;
+    })) as never;
     const dependencies = dependenciesFor(copySource, badRuntime);
     await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-sysid" }), dependencies))
       .rejects.toThrow(MigrationVerificationDriverError);
@@ -2557,10 +2604,10 @@ describe("readSequenceSelfConsistencyMismatches", () => {
   });
   it("flags a domain whose sequence last_value is null even though rows exist (never called despite copied data)", async () => {
     const session = fakeSession({ sequenceState: { conversations: { maxValue: "500", lastValue: null } } });
-    // sequenceState omits the sequence entirely (no seq_name resolvable),
-    // so readSequenceStoredState returns null: a sequence that cannot be
-    // read at all must fail closed, exactly like one that is genuinely
-    // never-called with a colliding start value.
+    // The named, privileged sequence has no stored state to read
+    // (pg_sequences returns no row): a sequence that cannot be read at all
+    // must fail closed, exactly like one that is genuinely never-called
+    // with a colliding start value.
     const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
     expect(mismatches).toEqual([{ domain: "conversations", class: "sequence", identitySha256: expect.any(String) }]);
   });
@@ -2596,14 +2643,14 @@ describe("readSequenceSelfConsistencyMismatches", () => {
     // claims is identity-backed would mean the map itself has drifted from
     // the schema; that must fail closed rather than silently pass.
     const session = {
-      query: vi.fn(async (config: { text: string }) => {
+      query: vi.fn(fused(async (config) => {
         if (config.text.includes("attidentity")) {
           return { rows: Object.values(SEQUENCE_BACKED_IDENTITY_COLUMN).map((target) => ({ table_name: target!.table.replace("lcm.", ""), column_name: target!.column })) };
         }
         if (config.text.includes("MAX(")) return { rows: [{ max_value: "500" }] };
         if (config.text.includes("pg_get_serial_sequence")) return { rows: [{ seq_name: null }] };
         return { rows: [{ admitted: true }] };
-      }),
+      })),
       close: vi.fn(async () => { /* fake */ }),
     };
     const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
@@ -2633,6 +2680,70 @@ describe("readSequenceSelfConsistencyMismatches", () => {
       await import("../../src/migration/activation-witness.js")
         .then((module) => module.migrationWitnessSha256(["sequence-self-consistency-privilege-denied-v1", "conversations"])),
     );
+  });
+  it("reads every table's MAX and sequence state in one statement after the completeness check (#1869)", async () => {
+    const session = fakeSession({ sequenceState: {
+      conversations: { maxValue: "500", lastValue: "500", isCalled: true, incrementBy: "1" },
+    } });
+    expect(await readSequenceSelfConsistencyMismatches(session as never, projectId)).toEqual([]);
+    expect(session.query).toHaveBeenCalledTimes(2);
+    const text = (session.query.mock.calls[1]![0] as { text: string }).text;
+    expect(text).not.toContain(";");
+    // Each lookup that can raise for a degraded sequence sits in a branch
+    // reached only for a table with a row, a named sequence, or a held privilege.
+    expect(text).toContain("CASE WHEN target.max_value IS NOT NULL THEN pg_catalog.pg_get_serial_sequence(target.table_name, target.column_name) END");
+    expect(text).toContain("CASE WHEN named.seq_name IS NOT NULL THEN pg_catalog.has_sequence_privilege(named.seq_name::regclass, 'SELECT,USAGE') END");
+    expect(text).toContain("CASE WHEN p.has_privilege THEN p.seq_name::regclass END");
+  });
+  it("reads a table missing from the fused sequence read as the separate empty MAX read did", async () => {
+    const session = {
+      query: vi.fn(async (config: { text: string }) => (config.text.includes("attidentity")
+        ? { rows: Object.values(SEQUENCE_BACKED_IDENTITY_COLUMN).map((target) => ({ table_name: target!.table.replace("lcm.", ""), column_name: target!.column })) }
+        : { rows: [] })),
+      close: vi.fn(async () => { /* fake */ }),
+    };
+    expect(await readSequenceSelfConsistencyMismatches(session as never, projectId)).toEqual([]);
+    expect(session.query).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("fused schema witness reads (#1869)", () => {
+  const digest = (value: unknown) => createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+
+  it("captures the migrations, search, collation and sequence inputs in one statement with unchanged digests", async () => {
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus").mockReturnValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
+    const runtime = fakeRuntime();
+    await expect(captureDestinationSchemaWitness(runtime as never)).resolves.toEqual({
+      version: 1,
+      migrationsSha256: EXPECTED_MIGRATIONS_SHA256,
+      searchConfigurationSha256: REAL_SEARCH_CONFIGURATION_SHA256,
+      collationSha256: digest(["lcm-migration-verification-collation-v1", [{ collname: "default", collcollate: "C", collctype: "C", collprovider: "c" }]]),
+      // The fake runtime answers the sequence-state read with its default row.
+      sequenceStateSha256: digest(["lcm-migration-verification-sequence-state-v1", [{ system_identifier: "7123456789" }]]),
+    });
+    expect(runtime.query).toHaveBeenCalledTimes(1);
+    const text = (runtime.query.mock.calls[0]![0] as { text: string }).text;
+    expect([...text.matchAll(FUSED_FRAGMENT)].map((match) => match[2])).toEqual(["0", "1", "2", "3"]);
+    expect(text).not.toContain(";");
+  });
+
+  it("re-reads the migrations, search and collation inputs in one statement and the system identifier in its own", async () => {
+    vi.spyOn(searchConfiguration, "postgreSqlSearchConfigurationStatus").mockReturnValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
+    const expected = await captureDestinationSchemaWitness(fakeRuntime() as never);
+    const session = fakeSession();
+    await assertSchemaWitnessLiveToLive(session as never, expected, "7123456789");
+    expect(session.query.mock.calls.map(([config]) => [...(config as { text: string }).text.matchAll(FUSED_FRAGMENT)].length)).toEqual([3, 0]);
+    expect((session.query.mock.calls[1]![0] as { text: string }).text).toContain("pg_control_system()");
+  });
+
+  it.each([
+    ["no row", []],
+    ["a part that is not a list", [{ f0: [], f1: "x", f2: [], f3: [] }]],
+  ] as const)("refuses a schema witness read with %s", async (_label, rows) => {
+    const executor = { query: vi.fn(async () => ({ rows })) };
+    await expect(captureDestinationSchemaWitness(executor as never)).rejects.toMatchObject({
+      reason: "invalid-input", message: "destination schema witness read returned an unexpected shape",
+    });
   });
 });
 

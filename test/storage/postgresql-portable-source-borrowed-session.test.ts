@@ -29,7 +29,7 @@ function borrowedSessionHarness(overrides: { backendPid?: number; projectId?: st
       switch (options.operation) {
         case 'portableRegisteredIdentity': return { rows: [{ admitted: true }] };
         case 'portableSourceWitness': return { rows: [{ database_name: 'source', database_oid: '123', server_address: '127.0.0.1', server_port: '5432' }] };
-        case 'portableSnapshotState': return { rows: [{ backend_pid: overrides.backendPid ?? 777, tls: true, isolation: 'repeatable read', read_only: 'on', captured_at: timestamp }] };
+        case 'portableSnapshotState': return { rows: [{ admitted: true, backend_pid: overrides.backendPid ?? 777, tls: true, isolation: 'repeatable read', read_only: 'on', captured_at: timestamp }] };
         default: throw new Error('unexpected SQL ' + options.operation);
       }
     }),
@@ -49,8 +49,10 @@ function borrowedSessionHarness(overrides: { backendPid?: number; projectId?: st
   const positions = new Map(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, new Map(rows(domain).map((row, index) => [locator(domain, row), index]))]));
   vi.spyOn(mapping, 'listCanonicalHeaders').mockImplementation(async (_db, _project, domain, after, limit) => {
     const values = rows(domain); const start = after === null ? 0 : positions.get(domain)!.get(after)! + 1;
-    return values.slice(start, start + limit).map((row) => ({ locator: locator(domain, row), byteLength: '1000' }));
+    return { headers: values.slice(start, start + limit).map((row) => ({ locator: locator(domain, row), byteLength: '1000' })), more: start + limit < values.length };
   });
+  vi.spyOn(mapping, 'readCanonicalDomainOccupancy').mockImplementation(async (_db, _project, domains) => (
+    new Map(domains.map((domain) => [domain, rows(domain).length > 0]))));
   vi.spyOn(mapping, 'readCanonicalRow').mockImplementation(async (_db, _project, domain, key) => byLocator.get(domain)!.get(key) ?? null);
   vi.spyOn(mapping, 'readCanonicalContentRows').mockImplementation(async (_db, _project, domain, locators) => {
     const found = new Map<string, Record<string, unknown>>();
@@ -60,7 +62,7 @@ function borrowedSessionHarness(overrides: { backendPid?: number; projectId?: st
     }
     return found;
   });
-  vi.spyOn(mapping, 'listConversationMessageHeaders').mockImplementation(async () => []);
+  vi.spyOn(mapping, 'listConversationMessageHeaders').mockImplementation(async () => ({ headers: [], more: false }));
   return { session, runtime, dependencies };
 }
 
@@ -110,9 +112,9 @@ describe('PostgreSQL portable source borrowed snapshot session', () => {
     h.dependencies.verifyRuntimeSchema.mockRejectedValue(new Error('should not be called for a borrowed session'));
     // Force admission to fail after the borrowed session is assigned but
     // before buildSource completes, by making the identity registration
-    // check on the borrowed session itself fail.
+    // proof of the borrowed session's authentication statement fail.
     h.session.query.mockImplementation(async (_config: unknown, options: { operation: string }) => {
-      if (options.operation === 'portableRegisteredIdentity') return { rows: [{ admitted: false }] };
+      if (options.operation === 'portableSnapshotState') return { rows: [{ admitted: false }] };
       throw new Error('unexpected SQL ' + options.operation);
     });
     await expect(adapter.createPostgreSqlPortableSource(
@@ -163,8 +165,11 @@ describe('PostgreSQL portable source domain census accessor', () => {
     expect(summariesCensus.terminalIdentitySha256).toBeNull();
     // Reading twice returns byte-identical cached evidence.
     expect(adapter.readPostgreSqlPortableSourceDomainCensus(source, 'machines')).toEqual(machinesCensus);
-    expect(h.session.query.mock.calls.filter((call) => (call[1] as { operation: string }).operation === 'portableRegisteredIdentity').length)
-      .toBeGreaterThan(0);
+    // Each authentication proves the registered identity inside the
+    // snapshot-state statement (#1869), never as a statement of its own.
+    const operations = h.session.query.mock.calls.map((call) => (call[1] as { operation: string }).operation);
+    expect(operations.filter((operation) => operation === 'portableSnapshotState').length).toBeGreaterThan(0);
+    expect(operations).not.toContain('portableRegisteredIdentity');
     await source.close();
   });
 

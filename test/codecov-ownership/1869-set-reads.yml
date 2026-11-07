@@ -1,0 +1,23 @@
+references: ["#1869"]
+rationale: >-
+  #1869 fuses independent PostgreSQL set reads into fewer statements.
+  Runtime readiness composes its role-policy, extension, collation,
+  search-configuration, migration-ledger and privilege checks into a few
+  statements, from SQL that extensions.ts, migrations.ts and
+  search-configuration.ts now export beside their evaluators. Migration
+  verification reads its schema witness inputs and its sequence state in one
+  statement each; the exported readSequenceStoredState in
+  src/migration/verify-generation.ts lost its only caller and is removed.
+  The portable destination fuses its occupancy, identity-fingerprint and
+  completion-count reads, and the portable source its occupancy and
+  authentication reads, over multi-domain helpers in portable-mapping.ts.
+  Every file keeps its existing owner.
+pins:
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/storage/postgresql/extensions.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/portable-source.ts", "integration-postgresql-portable"]
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/search-configuration.ts", "integration-postgresql-search"]

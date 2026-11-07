@@ -3,8 +3,9 @@ import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
 import { PostgreSqlLeaseFenceError, PostgreSqlWorkCoordinator } from "../storage/postgresql/coordination.js";
 import { verifyPostgreSqlTransferSchema } from "../storage/postgresql/runtime-readiness.js";
 import {
-  inspectPostgreSqlSearchConfiguration,
+  POSTGRESQL_SEARCH_CONFIGURATION_STATUS_SQL,
   POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+  postgreSqlSearchConfigurationStatus,
 } from "../storage/postgresql/search-configuration.js";
 import {
   createPostgreSqlPortableSource, readPostgreSqlPortableSourceDomainCensus,
@@ -15,7 +16,9 @@ import { PostgreSqlLexicalSearchRepository } from "../storage/postgresql/lexical
 import { mappingForDomain } from "../storage/postgresql/portable-mapping.js";
 import { PORTABLE_INITIAL_CHECKPOINT_SHA256, probePostgreSqlPortableDestination } from "../storage/postgresql/portable-destination.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
-import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
+import type {
+  PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlSearchConfigurationStatus,
+} from "../storage/postgresql/contracts.js";
 import {
   PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_LIMITS, canonicalJson as portableCanonicalJson,
   derivePortableConversationIdentity,
@@ -169,33 +172,23 @@ export function assertDestinationIdentityMatches(
   }
 }
 
-async function captureCollationSha256(executor: PostgreSqlQueryExecutor, signal?: AbortSignal): Promise<string> {
-  // Collation-sensitive columns are the text columns compared or ordered by
-  // portable-mapping.ts's canonical row queries (COLLATE "C" locator/key
-  // expressions rely on database default collation for value comparisons).
-  const result = await executor.query<{ collname: string; collcollate: string; collctype: string; collprovider: string }>({
-    text: "SELECT c.collname, c.collcollate, c.collctype, c.collprovider "
-      + "FROM pg_catalog.pg_collation c "
-      + "JOIN pg_catalog.pg_database d ON d.datcollate OPERATOR(pg_catalog.=) c.collcollate "
-      + "AND d.datctype OPERATOR(pg_catalog.=) c.collctype "
-      + "WHERE d.datname OPERATOR(pg_catalog.=) current_database() "
-      + "ORDER BY c.collname",
-  }, { domain: "factory", operation: "verifyGenerationCollation", signal });
-  return sha256Hex(portableCanonicalJson(["lcm-migration-verification-collation-v1", result.rows]));
-}
+// Collation-sensitive columns are the text columns compared or ordered by
+// portable-mapping.ts's canonical row queries (COLLATE "C" locator/key
+// expressions rely on database default collation for value comparisons).
+const COLLATION_SQL = "SELECT c.collname, c.collcollate, c.collctype, c.collprovider "
+  + "FROM pg_catalog.pg_collation c "
+  + "JOIN pg_catalog.pg_database d ON d.datcollate OPERATOR(pg_catalog.=) c.collcollate "
+  + "AND d.datctype OPERATOR(pg_catalog.=) c.collctype "
+  + "WHERE d.datname OPERATOR(pg_catalog.=) current_database() "
+  + "ORDER BY c.collname";
 
-async function captureSequenceStateSha256(executor: PostgreSqlQueryExecutor, signal?: AbortSignal): Promise<string> {
-  const result = await executor.query<{ sequence_name: string; is_called: boolean; start_value: string; increment_by: string }>({
-    text: "SELECT c.relname AS sequence_name, s.seqstart::text AS start_value, s.seqincrement::text AS increment_by, "
-      + "pg_catalog.pg_sequence_last_value(c.oid) IS NOT NULL AS is_called "
-      + "FROM pg_catalog.pg_class c "
-      + "JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace "
-      + "JOIN pg_catalog.pg_sequence s ON s.seqrelid OPERATOR(pg_catalog.=) c.oid "
-      + "WHERE n.nspname OPERATOR(pg_catalog.=) 'lcm' AND c.relkind OPERATOR(pg_catalog.=) 'S' "
-      + "ORDER BY c.relname",
-  }, { domain: "factory", operation: "verifyGenerationSequenceState", signal });
-  return sha256Hex(portableCanonicalJson(["lcm-migration-verification-sequence-state-v1", result.rows]));
-}
+const SEQUENCE_STATE_SQL = "SELECT c.relname AS sequence_name, s.seqstart::text AS start_value, s.seqincrement::text AS increment_by, "
+  + "pg_catalog.pg_sequence_last_value(c.oid) IS NOT NULL AS is_called "
+  + "FROM pg_catalog.pg_class c "
+  + "JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace "
+  + "JOIN pg_catalog.pg_sequence s ON s.seqrelid OPERATOR(pg_catalog.=) c.oid "
+  + "WHERE n.nspname OPERATOR(pg_catalog.=) 'lcm' AND c.relkind OPERATOR(pg_catalog.=) 'S' "
+  + "ORDER BY c.relname";
 
 /**
  * Round-1 P2: migrationsSha256 must witness what the destination's own
@@ -209,15 +202,59 @@ async function captureSequenceStateSha256(executor: PostgreSqlQueryExecutor, sig
  * expected value for a reason unrelated to what is actually on the
  * destination.
  */
-async function captureAppliedMigrationsSha256(
-  executor: PostgreSqlQueryExecutor, signal?: AbortSignal,
-): Promise<string> {
-  const result = await executor.query<{ id: string; checksum_sha256: string }>({
-    text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
-  }, { domain: "factory", operation: "verifyGenerationAppliedMigrations", signal });
-  return sha256Hex(portableCanonicalJson(
-    result.rows.map(({ id, checksum_sha256: checksum }) => ({ id, sha256: checksum })),
-  ));
+const APPLIED_MIGRATIONS_SQL = "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id";
+
+type SchemaWitnessInputs = Readonly<{
+  migrationsSha256: string;
+  searchStatus: PostgreSqlSearchConfigurationStatus;
+  collationSha256: string;
+  sequenceStateSha256: string | null;
+}>;
+
+function witnessRows(value: unknown): readonly Record<string, unknown>[] {
+  if (!Array.isArray(value)) driverError("invalid-input", "destination schema witness read returned an unexpected shape");
+  return value as Record<string, unknown>[];
+}
+
+/** One read of the fused schema witness: its SQL and the ORDER BY its digest depends on. */
+type SchemaWitnessFragment = Readonly<{ text: string; order?: string }>;
+
+const SCHEMA_WITNESS_FRAGMENTS: readonly SchemaWitnessFragment[] = [
+  { text: APPLIED_MIGRATIONS_SQL, order: "fragment_row.id" },
+  { text: POSTGRESQL_SEARCH_CONFIGURATION_STATUS_SQL },
+  { text: COLLATION_SQL, order: "fragment_row.collname" },
+  { text: SEQUENCE_STATE_SQL, order: "fragment_row.sequence_name" },
+];
+
+/**
+ * The schema witness inputs in one statement (#1869): the applied migration
+ * ledger, the search-configuration status with its own guarded deparser
+ * settings, the collation rows and, when asked, the sequence state. The
+ * ledger read leads and is the only part that can raise, given the transfer
+ * readiness check that ran before it in the same phase. Each list keeps its
+ * old ORDER BY and decodes to the rows the separate reads returned, so every
+ * digest is unchanged.
+ */
+async function readSchemaWitnessInputs(
+  executor: PostgreSqlQueryExecutor, operation: string, sequenceState: boolean, signal?: AbortSignal,
+): Promise<SchemaWitnessInputs> {
+  const fragments = SCHEMA_WITNESS_FRAGMENTS.slice(0, sequenceState ? 4 : 3);
+  const result = await executor.query<Record<string, unknown>>({
+    text: "SELECT " + fragments.map((fragment, index) => "(SELECT COALESCE(pg_catalog.json_agg(fragment_row"
+      + (fragment.order === undefined ? "" : " ORDER BY " + fragment.order) + "), '[]'::pg_catalog.json) FROM ("
+      + fragment.text + ") AS fragment_row) AS f" + String(index)).join(", "),
+  }, { domain: "factory", operation, signal });
+  const [migrations, search, collations, sequenceStates] = fragments.map((_fragment, index) => witnessRows(result.rows[0]?.["f" + String(index)]));
+  return {
+    migrationsSha256: sha256Hex(portableCanonicalJson(
+      migrations!.map(({ id, checksum_sha256: checksum }) => ({ id, sha256: checksum })),
+    )),
+    searchStatus: postgreSqlSearchConfigurationStatus(search![0] as Parameters<typeof postgreSqlSearchConfigurationStatus>[0]),
+    collationSha256: sha256Hex(portableCanonicalJson(["lcm-migration-verification-collation-v1", collations])),
+    sequenceStateSha256: sequenceStates === undefined
+      ? null
+      : sha256Hex(portableCanonicalJson(["lcm-migration-verification-sequence-state-v1", sequenceStates])),
+  };
 }
 
 /**
@@ -241,8 +278,8 @@ function searchConfigurationAbsentReason(status: Readonly<{ objectCount: number;
 export async function captureDestinationSchemaWitness(
   executor: PostgreSqlQueryExecutor, signal?: AbortSignal,
 ): Promise<MigrationSchemaWitness> {
-  const migrationsSha256 = await captureAppliedMigrationsSha256(executor, signal);
-  const searchStatus = await inspectPostgreSqlSearchConfiguration(executor, { signal });
+  const witness = await readSchemaWitnessInputs(executor, "verifyGenerationSchemaWitness", true, signal);
+  const searchStatus = witness.searchStatus;
   if (searchStatus.actualSha256 === null) driverError("invalid-input", searchConfigurationAbsentReason(searchStatus));
   // Round-3 P2: the in-window comparison below (assertSchemaWitnessLiveToLive)
   // only proves the pre-window and in-window reads agree with each
@@ -259,13 +296,9 @@ export async function captureDestinationSchemaWitness(
   if (searchStatus.actualSha256 !== POSTGRESQL_SEARCH_CONFIGURATION_SHA256) {
     driverError("invalid-input", "destination search configuration digest does not match the pinned lcm.search_v1 contract");
   }
-  const [collationSha256, sequenceStateSha256] = await Promise.all([
-    captureCollationSha256(executor, signal),
-    captureSequenceStateSha256(executor, signal),
-  ]);
   return parseMigrationSchemaWitness({
-    version: 1, migrationsSha256, searchConfigurationSha256: searchStatus.actualSha256,
-    collationSha256, sequenceStateSha256,
+    version: 1, migrationsSha256: witness.migrationsSha256, searchConfigurationSha256: searchStatus.actualSha256,
+    collationSha256: witness.collationSha256, sequenceStateSha256: witness.sequenceStateSha256!,
   });
 }
 
@@ -288,7 +321,7 @@ export async function captureDestinationSchemaWitness(
  *
  * Round-4: system_identifier and the migrations chain digest were both
  * captured once before the lease was even acquired (captureDestinationIdentity
- * and captureAppliedMigrationsSha256, step 2) and never rechecked --
+ * and the schema witness, step 2) and never rechecked --
  * unlike search configuration and collation, both of these DO have a
  * pre-window comparison (against expectedSystemIdentifier and
  * destinationMigrationsSha256 respectively), but neither of those
@@ -300,18 +333,20 @@ export async function captureDestinationSchemaWitness(
  * no longer the one identity-witnessed and schema-witnessed at step 2.
  * Both are now rechecked live-to-live here too, closing the interval
  * this function's own name already promised to cover but did not.
+ *
+ * #1869: the migrations, search-configuration and collation inputs come from
+ * one statement, then the system identifier from its own; both run before any
+ * comparison, and the comparisons keep their order.
  */
 export async function assertSchemaWitnessLiveToLive(
   session: PostgreSqlSnapshotSession, expected: MigrationSchemaWitness, expectedSystemIdentifier: string, signal?: AbortSignal,
 ): Promise<void> {
-  const [searchStatus, collationSha256, migrationsSha256, systemIdentifierResult] = await Promise.all([
-    inspectPostgreSqlSearchConfiguration(session, { signal }),
-    captureCollationSha256(session, signal),
-    captureAppliedMigrationsSha256(session, signal),
-    session.query<{ system_identifier: string }>({
-      text: "SELECT system_identifier::text AS system_identifier FROM pg_catalog.pg_control_system()",
-    }, { domain: "factory", operation: "verifyGenerationDestinationIdentityLiveToLive", signal }),
-  ]);
+  const { searchStatus, collationSha256, migrationsSha256 } = await readSchemaWitnessInputs(
+    session, "verifyGenerationSchemaWitnessLiveToLive", false, signal,
+  );
+  const systemIdentifierResult = await session.query<{ system_identifier: string }>({
+    text: "SELECT system_identifier::text AS system_identifier FROM pg_catalog.pg_control_system()",
+  }, { domain: "factory", operation: "verifyGenerationDestinationIdentityLiveToLive", signal });
   if (searchStatus.actualSha256 === null) driverError("invalid-input", searchConfigurationAbsentReason(searchStatus));
   if (searchStatus.actualSha256 !== expected.searchConfigurationSha256) {
     driverError("destination-drift", "destination search configuration changed inside the fenced verification window");
@@ -1236,12 +1271,12 @@ export const SEQUENCE_BACKED_IDENTITY_COLUMN: Readonly<Partial<Record<PortableDo
  */
 
 /**
- * Reads the sequence's own stored, on-disk state through
+ * A sequence's own stored, on-disk state, read through
  * pg_catalog.pg_sequences -- never pg_sequence_last_value(). An earlier
  * round characterised that function as session-local; the documented
  * failure mode for it and for pg_sequences.last_value is actually
  * privilege and never-called state, not which session is asking. Two
- * distinct NULL-producing cases exist and this function tells them apart
+ * distinct NULL-producing cases exist and the sequence read tells them apart
  * instead of collapsing them: a role lacking USAGE/SELECT on the
  * sequence, and a sequence genuinely never advanced (is_called = false).
  * Collapsing them would let a privilege gap present as "never called",
@@ -1272,39 +1307,51 @@ export type MigrationSequenceStoredState =
   | Readonly<{ kind: "never-called"; startValue: bigint }>
   | Readonly<{ kind: "called"; lastValue: bigint; incrementBy: bigint }>;
 
-export async function readSequenceStoredState(
-  session: PostgreSqlSnapshotSession, table: string, column: string, signal?: AbortSignal,
-): Promise<MigrationSequenceStoredState> {
-  const nameResult = await session.query<{ seq_name: string | null }>({
-    text: "SELECT pg_catalog.pg_get_serial_sequence($1, $2) AS seq_name",
-    values: [table, column],
-  }, { domain: "factory", operation: "verifyGenerationSequenceName", signal });
-  const seqName = nameResult.rows[0]?.seq_name ?? null;
-  if (seqName === null) return { kind: "no-sequence" };
-  // has_sequence_privilege is an introspection function callable
-  // regardless of ACL on the target: it reports what the role could do,
-  // never requires SELECT to run. A comma-separated privilege list
-  // returns true if either is held, matching the two readable paths
-  // above (the direct read needs SELECT, the view accepts either).
-  const privilegeResult = await session.query<{ has_privilege: boolean | null }>({
-    text: "SELECT pg_catalog.has_sequence_privilege($1::regclass, 'SELECT,USAGE') AS has_privilege",
-    values: [seqName],
-  }, { domain: "factory", operation: "verifyGenerationSequencePrivilege", signal });
-  if (privilegeResult.rows[0]?.has_privilege !== true) return { kind: "privilege-denied" };
-  const result = await session.query<{ last_value: string | null; start_value: string; increment_by: string }>({
-    text: "SELECT ps.last_value::text AS last_value, ps.start_value::text AS start_value, "
-      + "ps.increment_by::text AS increment_by "
-      + "FROM pg_catalog.pg_sequences ps "
-      + "JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) ps.schemaname "
-      + "JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid "
-      + "AND c.relname OPERATOR(pg_catalog.=) ps.sequencename "
-      + "WHERE c.oid OPERATOR(pg_catalog.=) $1::regclass",
-    values: [seqName],
-  }, { domain: "factory", operation: "verifyGenerationSequenceLastValue", signal });
-  const row = result.rows[0];
-  if (row === undefined) return { kind: "no-sequence" };
-  if (row.last_value === null) return { kind: "never-called", startValue: BigInt(row.start_value) };
-  return { kind: "called", lastValue: BigInt(row.last_value), incrementBy: BigInt(row.increment_by) };
+type SequenceSelfConsistencyRow = Readonly<{
+  position: number; max_value: string | null; seq_name: string | null; has_privilege: boolean | null;
+  last_value: string | null; start_value: string | null; increment_by: string | null; found: boolean | null;
+}>;
+
+/**
+ * Every sequence-backed table's MAX and stored sequence state in one
+ * statement (#1869), one row per table in map order. The serial-sequence
+ * lookup runs only for a table with a row; the privilege check and the
+ * regclass cast only for a found name; the pg_sequences read only for a
+ * privileged sequence; each inside its CASE branch, so an empty table never
+ * looks up its sequence. has_sequence_privilege is an introspection function
+ * callable regardless of ACL on the target: it reports what the role could
+ * do and never requires SELECT. Its comma-separated privilege list is true
+ * if either is held, matching the two readable paths described above (the
+ * direct read needs SELECT, the view accepts either). Table and column names
+ * are the compile-time map's constants.
+ */
+function sequenceSelfConsistencySql(targets: readonly Readonly<{ table: string; column: string }>[]): string {
+  return "WITH target(position, max_value, table_name, column_name) AS (VALUES "
+    + targets.map((target, index) => "(" + String(index + 1) + ", (SELECT MAX(" + target.column + ")::text FROM " + target.table
+      + "), '" + target.table + "', '" + target.column + "')").join(", ")
+    + "), named AS (SELECT target.position, target.max_value, CASE WHEN target.max_value IS NOT NULL "
+    + "THEN pg_catalog.pg_get_serial_sequence(target.table_name, target.column_name) END AS seq_name FROM target), "
+    + "privileged AS (SELECT named.position, named.max_value, named.seq_name, CASE WHEN named.seq_name IS NOT NULL "
+    + "THEN pg_catalog.has_sequence_privilege(named.seq_name::regclass, 'SELECT,USAGE') END AS has_privilege FROM named) "
+    + "SELECT p.position, p.max_value, p.seq_name, p.has_privilege, stored.last_value, stored.start_value, "
+    + "stored.increment_by, stored.found FROM privileged p LEFT JOIN LATERAL ("
+    + "SELECT ps.last_value::text AS last_value, ps.start_value::text AS start_value, "
+    + "ps.increment_by::text AS increment_by, true AS found "
+    + "FROM pg_catalog.pg_sequences ps "
+    + "JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) ps.schemaname "
+    + "JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid "
+    + "AND c.relname OPERATOR(pg_catalog.=) ps.sequencename "
+    + "WHERE c.oid OPERATOR(pg_catalog.=) CASE WHEN p.has_privilege THEN p.seq_name::regclass END"
+    + ") AS stored ON true ORDER BY p.position";
+}
+
+/** One table's stored sequence state, classified in the old per-table order: no sequence, then privilege, then never called, then called. */
+function sequenceStoredState(row: SequenceSelfConsistencyRow): MigrationSequenceStoredState {
+  if ((row.seq_name ?? null) === null) return { kind: "no-sequence" };
+  if (row.has_privilege !== true) return { kind: "privilege-denied" };
+  if (row.found !== true) return { kind: "no-sequence" };
+  if (row.last_value === null) return { kind: "never-called", startValue: BigInt(row.start_value!) };
+  return { kind: "called", lastValue: BigInt(row.last_value), incrementBy: BigInt(row.increment_by!) };
 }
 
 /**
@@ -1350,8 +1397,17 @@ export async function readSequenceSelfConsistencyMismatches(
   session: PostgreSqlSnapshotSession, projectId: string, signal?: AbortSignal,
 ): Promise<MigrationVerificationMismatch[]> {
   await assertSequenceBackedIdentityColumnCompleteness(session, signal);
+  const targets = Object.entries(SEQUENCE_BACKED_IDENTITY_COLUMN);
+  // #1869: one statement reads every table's MAX and, only for a table with
+  // a row, its sequence name, privilege and stored state, each inside a CASE
+  // branch so an empty table never looks its sequence up. Rows are then
+  // classified per table in the old order.
+  const result = await session.query<SequenceSelfConsistencyRow>({
+    text: sequenceSelfConsistencySql(targets.map(([, target]) => target)),
+  }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistency", projectId, signal });
+  const rows = new Map(result.rows.map((row) => [row.position, row]));
   const mismatches: MigrationVerificationMismatch[] = [];
-  for (const [domain, target] of Object.entries(SEQUENCE_BACKED_IDENTITY_COLUMN)) {
+  for (const [index, [domain]] of targets.entries()) {
     // Round-4 P1: identity sequences are global per table, shared by
     // every project, not per-project. Scoping this MAX to the project
     // being verified meant an empty (or low-water) project skipped the
@@ -1362,17 +1418,15 @@ export async function readSequenceSelfConsistencyMismatches(
     // row that already exists in this table", which is a table-wide
     // fact, not a project-scoped one, so the query is now table-wide to
     // match.
-    const maxResult = await session.query<{ max_value: string | null }>({
-      text: "SELECT MAX(" + target.column + ")::text AS max_value FROM " + target.table,
-    }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistencyMax", projectId, signal });
-    const maxValue = maxResult.rows[0]?.max_value ?? null;
+    const row = rows.get(index + 1);
+    const maxValue = row?.max_value ?? null;
     // Empty table (across every project, not just the one being
     // verified): nothing exists anywhere to collide with, so the bound
     // holds vacuously regardless of sequence state or privilege. Reading
     // the sequence is only meaningful once some row, in any project,
     // exists to protect.
     if (maxValue === null) continue;
-    const state = await readSequenceStoredState(session, target.table, target.column, signal);
+    const state = sequenceStoredState(row!);
     if (state.kind === "privilege-denied") {
       // A privilege gap is a refusal in its own right, never evidence
       // about sequence state: collapsing it into "never called" would

@@ -48,12 +48,11 @@ function guardedRuntimeDeparserSql(expression: string): string {
           END`;
 }
 
-export async function inspectPostgreSqlSearchConfiguration(
-  executor: PostgreSqlQueryExecutor,
-  options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
-): Promise<PostgreSqlSearchConfigurationStatus> {
-  const result = await executor.query<SearchConfigurationRow>({
-      text: `WITH ${runtimeDeparserSettingsSql()},
+/**
+ * The search-configuration status read as one unbound statement, with its
+ * own guarded deparser settings, so a caller may embed it in a fused read.
+ */
+export const POSTGRESQL_SEARCH_CONFIGURATION_STATUS_SQL = `WITH ${runtimeDeparserSettingsSql()},
            target AS (
              SELECT configuration.oid,
                     configuration.cfgparser,
@@ -200,13 +199,12 @@ export async function inspectPostgreSqlSearchConfiguration(
                     false
                   ) AS ownership_ready
            FROM configuration_contract
-           CROSS JOIN function_contract`,
-  }, {
-    domain: "factory",
-    operation: options.operation ?? "inspectSearchConfiguration",
-    signal: options.signal,
-  });
-  const row = result.rows[0];
+           CROSS JOIN function_contract`;
+
+/** Evaluates one row of POSTGRESQL_SEARCH_CONFIGURATION_STATUS_SQL. */
+export function postgreSqlSearchConfigurationStatus(
+  row: Partial<SearchConfigurationRow> | undefined,
+): PostgreSqlSearchConfigurationStatus {
   const actualSha256 = row?.actual_sha256 ?? null;
   const objectCount = Number.parseInt(row?.object_count ?? "0", 10);
   const ownershipReady = row?.ownership_ready === true;
@@ -220,6 +218,20 @@ export async function inspectPostgreSqlSearchConfiguration(
       && objectCount === 19
       && ownershipReady,
   };
+}
+
+export async function inspectPostgreSqlSearchConfiguration(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
+): Promise<PostgreSqlSearchConfigurationStatus> {
+  const result = await executor.query<SearchConfigurationRow>({
+    text: POSTGRESQL_SEARCH_CONFIGURATION_STATUS_SQL,
+  }, {
+    domain: "factory",
+    operation: options.operation ?? "inspectSearchConfiguration",
+    signal: options.signal,
+  });
+  return postgreSqlSearchConfigurationStatus(result.rows[0]);
 }
 
 export async function assertPostgreSqlSearchConfigurationReady(
