@@ -106,7 +106,7 @@
     "verify:portable-package": "node scripts/verify-portable-package.mjs && tsc --project tsconfig.portable-package.json"
   },
   "dependencies": {
-    "@hono/node-server": "2.1.5",
+    "@hono/node-server": "2.1.6",
     "@sinclair/typebox": "0.34.52",
     "@types/pg": "8.23.1",
     "commander": "15.0.0",
